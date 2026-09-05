@@ -109,8 +109,8 @@ Cartesian workspace box in the base frame; `tcp_speed_max`; `force_max` and
 `torque_max` (gravity and payload compensated); gripper position range and
 rate; `watchdog_s`, `max_dt_s`, `min_dt_s`, `stale_escalate_n` and
 `tracking_tol_rad`; `plant_margin_rad` and `plant_margin_m` for invariant (B);
-`bisect_iters`; and two cumulative budgets, `path_budget_m` and
-`contact_time_budget_s`.
+`bisect_iters`; `brake_headroom`; and two cumulative budgets, `path_budget_m`
+and `contact_time_budget_s`.
 
 An energy budget was considered and dropped. Energy is not defined without a
 dynamics model, and section 11 rules one out, so a field named `energy_budget_j`
@@ -204,10 +204,44 @@ additionally capped at
 qd_allowed = sqrt(2 * qdd_max * distance_to_nearest_limit)
 ```
 
-so the joint can always come to rest before the limit under `qdd_max`. The
-full chain is jerk, then acceleration, then velocity, then the braking bound,
-then position, applied as nested clamps on the step from the current
-measured configuration.
+so the joint can always come to rest before the limit under `qdd_max`.
+
+That continuous bound, applied last in a nested clamp, is not sufficient. The
+design was corrected before implementation after measuring it. Three things go
+wrong, all in the braking transition, and all showing up as the emitted command
+sequence violating the very limits the clamps exist to enforce:
+
+1. Near the limit the continuous bound shrinks faster than `qdd_max * dt`, so
+   one discrete step must shed more velocity than the acceleration limit allows.
+2. When the final position clip bites, the emitted velocity is no longer the
+   clamped one, so the emitted acceleration is not the clamped one either.
+3. When velocity saturates at `qd_max`, acceleration must fall from `qdd_max` to
+   zero in a single step, a jerk of `qdd_max / dt`.
+
+Measured on this design's own ramp test, the naive chain produced 8.81 rad/s^2
+against a 5.0 limit and 174.8 rad/s^3 against a 100.0 limit.
+
+The corrected chain has three parts. The velocity target is settled first,
+including the braking bound, and jerk and acceleration then shape the approach
+to it, so the number that is clamped is the number that is emitted. The bound is
+the discrete-exact form, capped by `d / dt` so the position clip never bites:
+
+```
+brake(d, a, dt) = min( -a*dt/2 + sqrt((a*dt/2)^2 + 2*a*d),  d/dt )
+```
+
+And that same bound is applied one derivative up, capping acceleration against
+the remaining velocity headroom, for exactly the reason it caps velocity against
+position headroom: acceleration must be able to reach zero before velocity
+saturates. Each bound plans to use only `brake_headroom` of the authority at the
+level above, leaving the rest for the discrete step. A measured sweep gives 0.8
+as the largest headroom that satisfies every limit exactly, so that is the
+declared value.
+
+At `brake_headroom = 0.8`, worst case over both directions and six seeded start
+states, the emitted sequence measures max `|qd|` = 1.000000 against 1.0, max
+`|qdd|` = 5.000000 against 5.0, and max `|qddd|` = 100.0000 against 100.0, with
+the position limits held and an arrival velocity of 0.
 
 For the Cartesian box the same reasoning does not give a closed form, so the
 kernel bisects along the segment from `q_now` to `q_cmd` for the largest step
