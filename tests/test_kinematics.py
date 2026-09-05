@@ -77,6 +77,25 @@ def test_jacobian_matches_finite_differences():
         assert np.allclose(J[:3, i], num, atol=1e-6)
 
 
+def test_jacobian_angular_rows_match_finite_differences():
+    # The linear rows are covered; the angular rows are not, and an axis or
+    # sign error there would pass every existing test. For a small rotation,
+    # R(q+eps) @ R(q-eps).T is approximately I + skew(omega * 2*eps), so the
+    # skew part recovers omega directly.
+    rng = np.random.default_rng(4)
+    q = rng.uniform(-2.0, 2.0, 6)
+    J = jacobian(q)
+    eps = 1e-6
+    for i in range(6):
+        dq = np.zeros(6)
+        dq[i] = eps
+        dR = fk(q + dq)[:3, :3] @ fk(q - dq)[:3, :3].T
+        omega = np.array([dR[2, 1] - dR[1, 2],
+                          dR[0, 2] - dR[2, 0],
+                          dR[1, 0] - dR[0, 1]]) / (2.0 * 2.0 * eps)
+        assert np.allclose(J[3:, i], omega, atol=1e-5)
+
+
 def test_fk_is_deterministic():
     q = np.array([0.1, -0.2, 0.3, -0.4, 0.5, -0.6])
     assert np.array_equal(fk(q), fk(q))
