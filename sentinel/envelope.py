@@ -8,10 +8,12 @@ named human and a date is an error.
 """
 from __future__ import annotations
 
+import collections.abc
 import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass, field, replace as _dc_replace
+from types import MappingProxyType
 
 import numpy as np
 
@@ -29,6 +31,7 @@ DATASHEET_PAYLOAD_KG = 5.0
 PROVENANCE_VALUES = ("datasheet", "declared", "measured")
 
 _ARRAY_FIELDS = ("q_min", "q_max", "qd_max", "qdd_max", "qddd_max")
+_META_FIELDS = ("name", "robot", "provenance", "measured_by", "measured_on")
 
 
 @dataclass(frozen=True, eq=False)
@@ -93,7 +96,7 @@ class Envelope:
             object.__setattr__(
                 self, name, np.array(getattr(self, name), dtype=float).reshape(N_JOINTS)
             )
-        object.__setattr__(self, "provenance", dict(self.provenance))
+        object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
         if not np.all(self.q_max > self.q_min):
             raise ValueError("q_max must exceed q_min on every joint")
         for name in ("qd_max", "qdd_max", "qddd_max"):
@@ -122,6 +125,10 @@ class Envelope:
         bad = {k: v for k, v in self.provenance.items() if v not in PROVENANCE_VALUES}
         if bad:
             raise ValueError(f"unknown provenance values: {bad}")
+        missing = [f.name for f in dataclasses.fields(self)
+                   if f.name not in _META_FIELDS and f.name not in self.provenance]
+        if missing:
+            raise ValueError(f"these fields have no provenance: {missing}")
         if "measured" in self.provenance.values() and not (self.measured_by and self.measured_on):
             raise ValueError(
                 "a provenance of 'measured' requires measured_by and measured_on; "
@@ -137,7 +144,7 @@ class Envelope:
                 d[f.name] = [float(x) for x in v]
             elif isinstance(v, Box):
                 d[f.name] = {"lo": [float(x) for x in v.lo], "hi": [float(x) for x in v.hi]}
-            elif isinstance(v, dict):
+            elif isinstance(v, collections.abc.Mapping):
                 d[f.name] = dict(v)
             else:
                 d[f.name] = v

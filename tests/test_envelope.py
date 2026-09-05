@@ -91,11 +91,13 @@ def test_envelope_brake_headroom_validation():
     Envelope.ur5e_declared().replace(brake_headroom=1.0)
 
 
-def test_mutating_input_provenance_dict_does_not_change_envelope():
-    prov = {"q_min": "declared", "q_max": "declared"}
-    env = Envelope.ur5e_declared().replace(provenance=prov)
-    prov["q_min"] = "measured"  # Mutate the input dict
-    assert env.provenance["q_min"] == "declared"  # Envelope should not be affected
+def test_the_returned_provenance_cannot_be_mutated():
+    env = Envelope.ur5e_declared()
+    before = env.sha256()
+    with pytest.raises(TypeError):
+        env.provenance["force_max"] = "measured"
+    assert env.provenance["force_max"] == "declared"
+    assert env.sha256() == before
 
 
 def test_mutating_input_arrays_does_not_change_stored_arrays():
@@ -137,3 +139,11 @@ def test_provenance_coverage_is_complete():
         "plant_margin_rad", "plant_margin_m", "bisect_iters", "brake_headroom"
     }
     assert set(env.provenance.keys()) == expected_fields
+
+
+def test_envelope_rejects_missing_provenance_entries():
+    d = Envelope.ur5e_declared().to_dict()
+    # Remove a provenance entry for a non-meta field
+    del d["provenance"]["force_max"]
+    with pytest.raises(ValueError, match="have no provenance"):
+        Envelope.from_dict(d)
