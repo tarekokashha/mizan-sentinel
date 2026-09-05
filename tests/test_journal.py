@@ -44,3 +44,18 @@ def test_deleting_a_line_is_detected(tmp_path):
     del lines[1]
     p.write_text("\n".join(lines) + "\n")
     assert verify(p)[0] is False
+
+
+def test_rewriting_the_envelope_hash_is_detected(tmp_path):
+    # The envelope hash is the whole point of the chain: it is what ties a
+    # report to the declaration that was in force. Leaving it outside the
+    # digest means a run can be silently re-attributed to any envelope.
+    p = tmp_path / "run.jsonl"
+    _write(p)
+    lines = p.read_text().splitlines()
+    rec = json.loads(lines[2])
+    rec["envelope_sha"] = "0" * 64
+    lines[2] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    p.write_text("\n".join(lines) + "\n")
+    ok, bad = verify(p)
+    assert ok is False and bad == 2

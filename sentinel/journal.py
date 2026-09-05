@@ -19,8 +19,8 @@ def _canon(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=float)
 
 
-def _digest(prev: str, payload) -> str:
-    return hashlib.sha256((prev + _canon(payload)).encode("utf-8")).hexdigest()
+def _digest(prev: str, envelope_sha: str, payload) -> str:
+    return hashlib.sha256((prev + envelope_sha + _canon(payload)).encode("utf-8")).hexdigest()
 
 
 class Journal:
@@ -35,7 +35,7 @@ class Journal:
         self._fh = self.path.open("a", encoding="utf-8", newline="\n")
 
     def append(self, payload: dict) -> str:
-        h = _digest(self._prev, payload)
+        h = _digest(self._prev, self.envelope_sha, payload)
         rec = {
             "seq": self._seq,
             "prev": self._prev,
@@ -68,7 +68,7 @@ def verify(path) -> tuple[bool, int]:
         rec = json.loads(line)
         if rec["seq"] != seq or rec["prev"] != prev:
             return False, i
-        if rec["hash"] != _digest(prev, rec["payload"]):
+        if rec["hash"] != _digest(prev, rec["envelope_sha"], rec["payload"]):
             return False, i
         prev, seq = rec["hash"], seq + 1
     return True, -1
