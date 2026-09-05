@@ -223,9 +223,19 @@ interpolated one.
 The single-sentence version conflates two claims of very different strength,
 so it is split. Both are asserted by the test suite.
 
-> **(A) Command invariant, exact.** For any initial state inside the envelope
-> and any sequence of actions, including malformed and adversarial ones, every
-> command emitted by the kernel satisfies the envelope. No tolerance.
+> **(A) Command invariant, exact.** For any *stoppable* initial state inside the
+> envelope and any sequence of actions, including malformed and adversarial
+> ones, every command emitted by the kernel satisfies the envelope. No
+> tolerance.
+
+Stoppable means, on every joint, `qd^2 <= 2 * qdd_max * d`, where `d` is the
+distance to the nearer position limit. The clause is not a convenience. A joint
+at `pi - 0.05` moving at 0.99 rad/s needs 9.8 rad/s^2 to stop against a declared
+5.0, so it is committed to an overshoot before the kernel is ever called. No
+acceleration-limited controller can rescue that state, and a claim that ignored
+this would be false rather than merely ambitious. The kernel still does the best
+available thing from such a state, braking at `qdd_max` and reporting the
+violation, but it does not promise (A) from there.
 
 > **(B) Plant invariant, with a declared margin.** The simulated plant driven
 > by those commands stays inside the envelope inflated by `plant_margin`,

@@ -39,8 +39,8 @@ class Box:
     hi: np.ndarray
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "lo", np.asarray(self.lo, dtype=float).reshape(3))
-        object.__setattr__(self, "hi", np.asarray(self.hi, dtype=float).reshape(3))
+        object.__setattr__(self, "lo", np.array(self.lo, dtype=float).reshape(3))
+        object.__setattr__(self, "hi", np.array(self.hi, dtype=float).reshape(3))
         if not np.all(self.hi > self.lo):
             raise ValueError("Box hi must exceed lo on every axis")
 
@@ -83,6 +83,7 @@ class Envelope:
     plant_margin_rad: float
     plant_margin_m: float
     bisect_iters: int
+    brake_headroom: float
     provenance: dict = field(default_factory=dict)
     measured_by: str | None = None
     measured_on: str | None = None
@@ -90,8 +91,9 @@ class Envelope:
     def __post_init__(self) -> None:
         for name in _ARRAY_FIELDS:
             object.__setattr__(
-                self, name, np.asarray(getattr(self, name), dtype=float).reshape(N_JOINTS)
+                self, name, np.array(getattr(self, name), dtype=float).reshape(N_JOINTS)
             )
+        object.__setattr__(self, "provenance", dict(self.provenance))
         if not np.all(self.q_max > self.q_min):
             raise ValueError("q_max must exceed q_min on every joint")
         for name in ("qd_max", "qdd_max", "qddd_max"):
@@ -109,6 +111,8 @@ class Envelope:
                      "contact_force_threshold_n", "plant_margin_rad", "plant_margin_m"):
             if not getattr(self, name) > 0:
                 raise ValueError(f"{name} must be positive")
+        if not 0.0 < self.brake_headroom <= 1.0:
+            raise ValueError("brake_headroom must be in (0.0, 1.0]")
         if self.min_dt_s >= self.max_dt_s:
             raise ValueError("min_dt_s must be below max_dt_s")
         if self.grip_max <= self.grip_min:
@@ -190,13 +194,18 @@ class Envelope:
             plant_margin_rad=0.02,
             plant_margin_m=0.005,
             bisect_iters=24,
+            brake_headroom=0.8,
             provenance={
                 "q_min": "declared", "q_max": "declared", "qd_max": "declared",
                 "qdd_max": "declared", "qddd_max": "declared", "tcp_box": "declared",
                 "tcp_speed_max": "declared", "force_max": "declared",
-                "torque_max": "declared", "grip_rate_max": "declared",
-                "watchdog_s": "declared", "max_dt_s": "declared",
-                "tracking_tol_rad": "declared", "path_budget_m": "declared",
-                "contact_time_budget_s": "declared",
+                "torque_max": "declared", "grip_min": "declared", "grip_max": "declared",
+                "grip_rate_max": "declared", "watchdog_s": "declared",
+                "min_dt_s": "declared", "max_dt_s": "declared",
+                "stale_escalate_n": "declared", "tracking_tol_rad": "declared",
+                "path_budget_m": "declared", "contact_time_budget_s": "declared",
+                "contact_force_threshold_n": "declared", "plant_margin_rad": "declared",
+                "plant_margin_m": "declared", "bisect_iters": "declared",
+                "brake_headroom": "declared",
             },
         )

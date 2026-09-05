@@ -45,7 +45,7 @@ class Violation:
 
 
 def _vec(x, n: int = N_JOINTS) -> np.ndarray:
-    return np.asarray(x, dtype=float).reshape(n)
+    return np.array(x, dtype=float).reshape(n)
 
 
 @dataclass(frozen=True, eq=False)
@@ -72,7 +72,7 @@ class Action:
     gripper: float | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "q", np.asarray(self.q, dtype=float).reshape(N_JOINTS))
+        object.__setattr__(self, "q", np.array(self.q, dtype=float).reshape(N_JOINTS))
 
 
 @dataclass(frozen=True, eq=False)
