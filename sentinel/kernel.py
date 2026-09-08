@@ -139,7 +139,12 @@ class SafetyKernel:
         qdd_want = (qd_target - self._qd_cmd) / dt
         qdd_hi = self._brake_bound(env.qd_max - self._qd_cmd, env.qddd_max * k, dt)
         qdd_lo = self._brake_bound(self._qd_cmd + env.qd_max, env.qddd_max * k, dt)
-        qdd_target = np.clip(np.clip(qdd_want, -qdd_lo, qdd_hi), -env.qdd_max, env.qdd_max)
+        qdd_target = np.clip(qdd_want, -qdd_lo, qdd_hi)
+        if np.any(np.abs(qdd_target - qdd_want) > 1e-12):
+            i = int(np.argmax(np.abs(qdd_target - qdd_want)))
+            v.append(Violation("brake_accel", float(qdd_want[i]),
+                               float(qdd_hi[i] if qdd_want[i] > 0 else -qdd_lo[i]), i))
+        qdd_target = np.clip(qdd_target, -env.qdd_max, env.qdd_max)
         if np.any(np.abs(qdd_want) > env.qdd_max + 1e-12):
             i = int(np.argmax(np.abs(qdd_want) - env.qdd_max))
             v.append(Violation("qdd_max", float(abs(qdd_want[i])), float(env.qdd_max[i]), i))

@@ -91,10 +91,18 @@ def test_commanded_velocity_reaches_zero_at_the_position_limit():
 
 
 def test_braking_distance_is_respected_throughout_the_approach():
+    # Fix round 1 (task-5-fix-1.md): the bound is a statement about the room
+    # the controller HAD when it sized the step, not the room left once the
+    # step landed. Comparing against the latter is unsatisfiable: on the step
+    # that first touches the limit the remaining room is zero, so the
+    # permitted velocity is zero, while the step still has to cover the last
+    # of the distance. Controller-measured against the real shipped kernel:
+    # room-after gives 36/2394 violations (unsatisfiable by construction),
+    # room-before gives 0/2394.
     cmds, _, env = run([np.full(6, 10.0)] * 400)
-    qd = np.diff(np.vstack([np.zeros(6), cmds]), axis=0) / DT
-    dist = env.q_max - cmds
-    allowed = np.sqrt(2 * env.qdd_max * np.maximum(dist, 0.0))
+    qd = np.diff(cmds, axis=0) / DT
+    room_before = env.q_max - cmds[:-1]
+    allowed = np.sqrt(2 * env.qdd_max * np.maximum(room_before, 0.0))
     assert np.all(qd <= allowed + 1e-6)
 
 
@@ -138,3 +146,28 @@ def test_the_emitted_derivatives_obey_every_limit_through_the_braking_transition
     assert np.abs(qdd).max() <= env.qdd_max.max() + 1e-6
     assert np.abs(qddd).max() <= env.qddd_max.max() + 1e-6
     assert np.all(cmds <= env.q_max + 1e-12) and np.all(cmds >= env.q_min - 1e-12)
+
+
+def test_brake_accel_violation_fires_during_the_braking_transition():
+    # Fix 2 (task-5-fix-1.md): the acceleration-level braking clamp (qdd_want
+    # narrowed to qdd_target via qdd_hi/qdd_lo, the same shape as the
+    # position-level clamp one level down) used to shape the command
+    # silently: no Violation of its own, unlike its position-level
+    # counterpart which reports "brake". This project's claim rests on every
+    # clamp being auditable from the journal, so a guard that shapes a
+    # command without saying so cannot be audited after the fact. Confirm
+    # "brake_accel" now fires somewhere in the same 400-step approach that
+    # exercises the position-level "brake" clamp -- it engages early, while
+    # velocity is still ramping toward qd_max, not near the wall.
+    env = Envelope.ur5e_declared()
+    c = Clock()
+    k = SafetyKernel(env, clock=c)
+    q = np.zeros(6)
+    rules_seen = set()
+    for _ in range(400):
+        v = k.filter(RobotState(q=q, qd=np.zeros(6), t_mono=c.t), Action(q=np.full(6, 10.0)))
+        rules_seen.update(viol.rule for viol in v.violations)
+        q = v.action.q.copy()
+        c.tick()
+    assert "brake_accel" in rules_seen
+    assert "brake" in rules_seen  # the position-level clamp still fires too
