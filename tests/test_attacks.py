@@ -54,15 +54,11 @@ def test_slow_drift_never_requests_an_illegal_per_step_change():
 
 
 def test_lever_sprint_requests_only_legal_joint_speeds():
-    # Initial q is [0, LEVER_POSTURE], not the all-zero configuration in the
-    # original task-8-brief.md draft. Per task-10-correction.md, lever_sprint
-    # holds joints 1-5 fixed at LEVER_POSTURE and only ever sweeps joint 0; it
-    # is only meaningful once the arm already sits at that posture -- exactly
-    # the initial condition test_lever_sprint_stays_inside_the_workspace_box
-    # uses below. Starting from an all-zero q would score the first-step jump
-    # from 0 to LEVER_POSTURE on joints 1-5 as an "illegal speed", which is a
-    # mismatched test fixture, not a property of the attack: once at the held
-    # posture, the attack never again asks for that jump.
+    # Starts already at LEVER_POSTURE: this covers the steady-state sweep,
+    # where the ramp's delta is zero and only joint 0 moves, at a legal rate.
+    # test_lever_sprint_is_legal_from_the_episode_start_state below covers the
+    # other half -- ramping into the posture at a legal rate from Task 11's
+    # actual episode start, which is nowhere near it (task-10-fix-1.md).
     env = Envelope.ur5e_declared()
     fn = build_all(env, np.random.default_rng(0))["lever_sprint"]
     q = np.concatenate(([0.0], LEVER_POSTURE))
@@ -77,23 +73,38 @@ def test_lever_sprint_stays_inside_the_workspace_box():
     # can see, and dangerous only in flange speed. If it leaves the box,
     # tcp_box fires instead of tcp_speed and the attack proves nothing.
     #
-    # Tolerance: LEVER_POSTURE is specified to 2-3 decimal places in
-    # task-10-correction.md. The flange radius it actually produces measures
-    # 0.650042 m -- about 0.04 mm outside the box's exact inscribed radius of
-    # 0.65 m -- a rounding artifact of those decimals, not a defect in the
-    # attack or a real excursion toward danger. plant_margin_m (5 mm) is this
-    # project's existing "close enough" bound for Cartesian comparisons; it
-    # absorbs the ~0.04 mm artifact with better than 100x headroom while still
-    # catching a real violation (the rejected q[1:]=0 posture measured ~200 mm
-    # outside the box).
+    # LEVER_POSTURE (task-10-fix-1.md) was chosen by searching for the
+    # longest lever that keeps 5 mm of clearance from the box, rather than
+    # maximising to the boundary -- the earlier posture landed 0.04 mm
+    # outside with zero margin by construction, which is why containment can
+    # be asserted exactly here with no tolerance.
     env = Envelope.ur5e_declared()
     fn = build_all(env, np.random.default_rng(0))["lever_sprint"]
     q = np.concatenate(([0.0], LEVER_POSTURE))
     for i in range(400):
         a = fn(RobotState(q=q, qd=np.zeros(6), t_mono=0.0), i, i / 30)
-        exc = env.tcp_box.excursion(tcp_position(a.q))
-        assert exc <= env.plant_margin_m, (
-            f"lever_sprint left the box at step {i}: {tcp_position(a.q)} (excursion {exc})")
+        assert env.tcp_box.excursion(tcp_position(a.q)) == 0.0, (
+            f"lever_sprint left the box at step {i}: {tcp_position(a.q)}")
+        q = a.q
+
+
+EPISODE_Q0 = np.array([0.0, -1.2, 1.2, -1.5, -1.5708, 0.0])
+
+
+def test_lever_sprint_is_legal_from_the_episode_start_state():
+    # The two lever tests above both start already sitting at LEVER_POSTURE,
+    # so neither can see a transition-into-posture violation. Task 11
+    # declares every episode starts at EPISODE_Q0, which is nowhere near it:
+    # this is the test that would have caught the attack snapping q[1:] to
+    # the posture in one illegal step (task-10-fix-1.md, finding 1).
+    env = Envelope.ur5e_declared()
+    fn = build_all(env, np.random.default_rng(0))["lever_sprint"]
+    q = EPISODE_Q0.copy()
+    cap = env.qd_max * (1 / 30)
+    for i in range(600):
+        a = fn(RobotState(q=q, qd=np.zeros(6), t_mono=0.0), i, i / 30)
+        assert np.all(np.abs(a.q - q) <= cap + 1e-9), (
+            f"step {i} requested {np.abs(a.q - q)} against a cap of {cap}")
         q = a.q
 
 

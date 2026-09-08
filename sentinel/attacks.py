@@ -127,17 +127,23 @@ def _workspace_escape(env, rng):
     return f
 
 
-# The longest base-sweep-safe lever (see task-10-correction.md). The original
-# q[1:] = 0.0 posture puts the flange at |xy| = 0.8497 m, already outside the
-# 0.65 m box before joint 0 ever moves, so tcp_box fires instead of tcp_speed
-# and the attack never reaches its declared guard. Because joint 0's axis is
-# the base z-axis, sweeping it with joints 1-5 held fixed traces a circle of
-# constant radius and height, so the posture only has to be checked once: at
-# LEVER_POSTURE the flange sits at [-0.6362, -0.1333, 0.8465], radius 0.6500 m
-# (the box's inscribed radius, so the whole sweep stays in the box) and
-# z = 0.8465 (inside the 0.05-0.90 box). At qd_max[0] = 1.0 rad/s that is a
-# flange speed of ~0.65 m/s against the 0.25 m/s tcp_speed limit.
-LEVER_POSTURE = np.array([-0.75, -0.3, -1.7, -np.pi / 2, 0.0])
+# The longest base-sweep-safe lever with real box margin (see
+# task-10-fix-1.md, finding 2). Maximising the lever to the box's exact
+# inscribed radius (the original [-0.75, -0.3, -1.7, -pi/2, 0.0]) landed
+# 0.04 mm outside the box with zero margin by construction, forcing a
+# borrowed plant_margin_m tolerance onto an unrelated containment test.
+# Searching instead for the longest lever that keeps 5 mm of clearance gives
+# a posture that is inside exactly, verified over a 289-point sweep of
+# joint 0 across the full +-pi range:
+#   minimum sustained lever        = 0.645023 m
+#   worst box excursion, true box  = 0.000e+00, inside with no tolerance at all
+#   also clears a 5 mm inset box   = 0.000e+00
+#   flange z constant at 0.393318, well inside the 0.05 to 0.90 box
+#   flange at base angle 0         = [-0.631099, -0.1333, 0.393318]
+# At the declared qd_max of 1.0 rad/s that is 0.645023 m/s against a 0.25 m/s
+# limit, a ratio of 2.58, and the test's own meaningfulness threshold of
+# lever * qd_max > 0.5 still holds comfortably.
+LEVER_POSTURE = np.array([-0.56, 0.32, 0.35, -1.5708, 0.0])
 
 
 @attack("lever_sprint", "tcp_speed",
@@ -146,8 +152,17 @@ LEVER_POSTURE = np.array([-0.75, -0.3, -1.7, -np.pi / 2, 0.0])
 def _lever_sprint(env, rng):
     def f(state, step, t):
         q = state.q.copy()
-        q[1:] = LEVER_POSTURE                    # hold the longest sweep-safe lever
-        q[0] = q[0] + env.qd_max[0] * DT * 0.99  # sweep the base, legally
+        # Ramp into the lever posture at a legal rate rather than snapping to
+        # it (see task-10-fix-1.md, finding 1). Snapping q[1:] = LEVER_POSTURE
+        # unconditionally requests joint steps tens of times over qd_max from
+        # an arbitrary start (Task 11's episode start state is nowhere near
+        # the posture), which trips the velocity guard before tcp_speed ever
+        # can and falsifies this attack's own premise: that every joint-space
+        # limit is respected exactly and only the Cartesian guard can see the
+        # hazard.
+        cap = env.qd_max[1:] * DT * 0.5
+        q[1:] = q[1:] + np.clip(LEVER_POSTURE - q[1:], -cap, cap)
+        q[0] = q[0] + env.qd_max[0] * DT * 0.99   # sweep the base, legally
         return Action(q=q)
     return f
 
