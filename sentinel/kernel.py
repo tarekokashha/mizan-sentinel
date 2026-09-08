@@ -86,6 +86,87 @@ class SafetyKernel:
         return Verdict(Status.STOP, Action(q=self._q_cmd.copy(), gripper=self._grip_cmd),
                        tuple(violations), dt, {"reason": reason})
 
+    @staticmethod
+    def _brake_bound(room, accel, dt):
+        """Largest velocity that can be brought to rest within `room`.
+
+        Two terms, and both matter. The first is the dt-corrected stopping
+        bound: it reduces to sqrt(2*a*room) as dt goes to zero and is strictly
+        tighter for a finite step, because a discrete controller sheds velocity
+        in dt-sized bites rather than continuously. The second, room/dt, keeps
+        the caller from overshooting `room` in the very next step; without it
+        the final position clip bites, the emitted velocity stops matching the
+        clamped one, and the emitted acceleration exceeds its limit.
+
+        Used at two levels: velocity against position headroom, and
+        acceleration against velocity headroom.
+        """
+        room = np.maximum(np.asarray(room, dtype=float), 0.0)
+        adt = accel * dt
+        stop = -0.5 * adt + np.sqrt(np.maximum((0.5 * adt) ** 2 + 2.0 * accel * room, 0.0))
+        return np.minimum(stop, room / dt)
+
+    def _shape(self, q_ref, q_des, dt) -> tuple[np.ndarray, list[Violation]]:
+        """Shape a request into a command whose own derivatives obey the envelope.
+
+        Order matters and is not the obvious one. Settle the velocity target
+        first, including the braking bound, then let jerk and acceleration
+        shape the approach to that target. Clamping the derivatives first and
+        recomputing velocity from a clipped position, which is the intuitive
+        order, means the number that was clamped is not the number that gets
+        emitted.
+        """
+        env = self.env
+        k = env.brake_headroom
+        v: list[Violation] = []
+
+        # --- position level: cap velocity so the joint can still stop -------- #
+        qd_raw = (q_des - q_ref) / dt
+        qd_want = np.clip(qd_raw, -env.qd_max, env.qd_max)
+        if np.any(np.abs(qd_raw) > env.qd_max + 1e-12):
+            i = int(np.argmax(np.abs(qd_raw) - env.qd_max))
+            v.append(Violation("qd_max", float(abs(qd_raw[i])), float(env.qd_max[i]), i))
+
+        brake_hi = self._brake_bound(env.q_max - q_ref, env.qdd_max * k, dt)
+        brake_lo = self._brake_bound(q_ref - env.q_min, env.qdd_max * k, dt)
+        qd_target = np.clip(qd_want, -brake_lo, brake_hi)
+        if np.any(np.abs(qd_target - qd_want) > 1e-12):
+            i = int(np.argmax(np.abs(qd_target - qd_want)))
+            v.append(Violation("brake", float(qd_want[i]),
+                               float(brake_hi[i] if qd_want[i] > 0 else -brake_lo[i]), i))
+
+        # --- velocity level: cap acceleration so it can return to zero ------- #
+        qdd_want = (qd_target - self._qd_cmd) / dt
+        qdd_hi = self._brake_bound(env.qd_max - self._qd_cmd, env.qddd_max * k, dt)
+        qdd_lo = self._brake_bound(self._qd_cmd + env.qd_max, env.qddd_max * k, dt)
+        qdd_target = np.clip(np.clip(qdd_want, -qdd_lo, qdd_hi), -env.qdd_max, env.qdd_max)
+        if np.any(np.abs(qdd_want) > env.qdd_max + 1e-12):
+            i = int(np.argmax(np.abs(qdd_want) - env.qdd_max))
+            v.append(Violation("qdd_max", float(abs(qdd_want[i])), float(env.qdd_max[i]), i))
+
+        # --- jerk level ------------------------------------------------------ #
+        qddd_want = (qdd_target - self._qdd_cmd) / dt
+        qddd = np.clip(qddd_want, -env.qddd_max, env.qddd_max)
+        if np.any(np.abs(qddd_want) > env.qddd_max + 1e-12):
+            i = int(np.argmax(np.abs(qddd_want) - env.qddd_max))
+            v.append(Violation("qddd_max", float(abs(qddd_want[i])), float(env.qddd_max[i]), i))
+
+        qdd = np.clip(self._qdd_cmd + qddd * dt, -env.qdd_max, env.qdd_max)
+        qd = np.clip(self._qd_cmd + qdd * dt, -env.qd_max, env.qd_max)
+        q_cmd = np.clip(q_ref + qd * dt, env.q_min, env.q_max)
+
+        q_des_clipped = np.clip(q_des, env.q_min, env.q_max)
+        if np.any(np.abs(q_des - q_des_clipped) > 1e-12):
+            i = int(np.argmax(np.abs(q_des - q_des_clipped)))
+            lim = env.q_max[i] if q_des[i] > q_des_clipped[i] else env.q_min[i]
+            v.append(Violation("q_limit", float(q_des[i]), float(lim), i))
+
+        # keep the stored derivatives equal to what was actually emitted
+        qd_real = (q_cmd - q_ref) / dt
+        self._qdd_cmd = (qd_real - self._qd_cmd) / dt
+        self._qd_cmd = qd_real
+        return q_cmd, v
+
     # ---- the decision ----------------------------------------------------- #
     def filter(self, state: RobotState, action: Action) -> Verdict:
         env = self.env
@@ -165,7 +246,11 @@ class SafetyKernel:
                 return self._stop(q_now, v, dt_raw, "arm is not tracking the command")
             return self._hold(q_now, v, dt_raw)
 
-        # guards 5 to 9 arrive in later tasks; for now emit the request
-        self._q_cmd = np.asarray(action.q, dtype=float).copy()
-        return Verdict(Status.PASS, Action(q=self._q_cmd.copy(), gripper=action.gripper),
-                       (), dt, {})
+        # 5. kinematic shaping
+        q_cmd, viols = self._shape(self._q_cmd, np.asarray(action.q, dtype=float), dt)
+        self._q_cmd = q_cmd
+        status = Status.CLAMPED if viols else Status.PASS
+        # guards 6 to 9 arrive in later tasks
+        return Verdict(status, Action(q=q_cmd.copy(), gripper=action.gripper),
+                       tuple(viols), dt,
+                       {"qd_cmd": self._qd_cmd.copy(), "qdd_cmd": self._qdd_cmd.copy()})
