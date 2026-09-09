@@ -219,6 +219,25 @@ class SafetyKernel:
             v.append(Violation("tcp_speed", sp, env.tcp_speed_max))
         return q_out, v
 
+    def _gripper(self, g, dt) -> tuple[float | None, list[Violation]]:
+        """Clamp a gripper request to range and rate. Runs last, and always,
+        regardless of what the arm guards decided."""
+        env = self.env
+        if g is None:
+            return self._grip_cmd, []
+        v = []
+        g = float(g)
+        clamped = float(np.clip(g, env.grip_min, env.grip_max))
+        if abs(clamped - g) > 1e-12:
+            v.append(Violation("grip_range", g, env.grip_max if g > env.grip_max else env.grip_min))
+        ref = self._grip_cmd if self._grip_cmd is not None else clamped
+        step = env.grip_rate_max * dt
+        rated = float(np.clip(clamped, ref - step, ref + step))
+        if abs(rated - clamped) > 1e-12:
+            v.append(Violation("grip_rate", abs(clamped - ref) / dt, env.grip_rate_max))
+        self._grip_cmd = rated
+        return rated, v
+
     # ---- the decision ----------------------------------------------------- #
     def filter(self, state: RobotState, action: Action) -> Verdict:
         env = self.env
@@ -250,6 +269,7 @@ class SafetyKernel:
         if self._q_cmd is None:
             self._q_cmd = q_now.copy()
             self._grip_cmd = float(state.gripper)
+            self._tcp_prev = tcp_position(q_now)
             self._t_src_fresh_at = now
             self._t_src_prev = float(state.t_mono)
             return Verdict(Status.HOLD, Action(q=q_now.copy(), gripper=self._grip_cmd),
@@ -298,11 +318,38 @@ class SafetyKernel:
                 return self._stop(q_now, v, dt_raw, "arm is not tracking the command")
             return self._hold(q_now, v, dt_raw)
 
-        # 5. kinematic shaping
+        # 5. contact: excess force or torque stops outright, never shortens
+        f = float(np.linalg.norm(state.wrench[:3]))
+        t_norm = float(np.linalg.norm(state.wrench[3:]))
+        if f > env.force_max:
+            return self._stop(q_now, [Violation("force_max", f, env.force_max)],
+                              dt_raw, "force envelope exceeded")
+        if t_norm > env.torque_max:
+            return self._stop(q_now, [Violation("torque_max", t_norm, env.torque_max)],
+                              dt_raw, "torque envelope exceeded")
+
+        # 6. cumulative budgets, reset only by rearm -- a budget that resets
+        # itself is not a budget. Checked before shaping for the same reason
+        # as guard 5: both are grounds to stop outright, not to shorten a step.
+        if f > env.contact_force_threshold_n:
+            self.contact_s += dt
+        self.path_m += float(np.linalg.norm(tcp_position(q_now) - self._tcp_prev)) \
+            if self._tcp_prev is not None else 0.0
+        self._tcp_prev = tcp_position(q_now)
+        if self.contact_s > env.contact_time_budget_s:
+            return self._stop(q_now, [Violation("contact_budget", self.contact_s,
+                                                env.contact_time_budget_s)],
+                              dt_raw, "contact time budget exhausted")
+        if self.path_m > env.path_budget_m:
+            return self._stop(q_now, [Violation("path_budget", self.path_m,
+                                                env.path_budget_m)],
+                              dt_raw, "path budget exhausted")
+
+        # 7. kinematic shaping
         q_ref = self._q_cmd.copy()
         q_cmd, viols = self._shape(q_ref, np.asarray(action.q, dtype=float), dt)
 
-        # 6. cartesian box and TCP speed, by conservative bisection
+        # 8. cartesian box and TCP speed, by conservative bisection
         q_cmd, cviols = self._cartesian(q_ref, q_cmd, dt)
         viols = list(viols) + list(cviols)
         if cviols:
@@ -313,8 +360,14 @@ class SafetyKernel:
             self._qdd_cmd = (qd_real - self._qd_cmd) / dt
             self._qd_cmd = qd_real
         self._q_cmd = q_cmd
+
+        # 9. gripper position and rate clamp -- always runs, independent of
+        # whatever the arm guards above decided
+        g_out, gviols = self._gripper(action.gripper, dt)
+        viols = viols + gviols
+
         status = Status.CLAMPED if viols else Status.PASS
-        # guards 7 to 9 arrive in later tasks
-        return Verdict(status, Action(q=q_cmd.copy(), gripper=action.gripper),
+        return Verdict(status, Action(q=q_cmd.copy(), gripper=g_out),
                        tuple(viols), dt,
-                       {"qd_cmd": self._qd_cmd.copy(), "tcp": tcp_position(q_cmd)})
+                       {"qd_cmd": self._qd_cmd.copy(), "tcp": tcp_position(q_cmd),
+                        "path_m": self.path_m, "contact_s": self.contact_s})
