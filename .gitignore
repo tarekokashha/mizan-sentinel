@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .hypothesis/
+
+# controller scratch: SDD ledger, task briefs, reports, review packages
+.superpowers/
+
+# run artefacts; results are committed deliberately, not incidentally
 results/*.jsonl
 results/*.csv
 !results/.gitkeep
