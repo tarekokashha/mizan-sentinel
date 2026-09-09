@@ -1,0 +1,16 @@
+attack,expect,episodes,escapes,escape_rate,cs_lo,cs_hi,expected_guard_fired,worst_joint_excursion,worst_tcp_excursion,rules_fired,envelope_override,wall_clock_s,envelope_sha256
+dt_spoof,qd_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|force_max|qd_max|qdd_max|qddd_max|tcp_speed,,98.70731989999967,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+force_grind,force_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|force_max|qdd_max|qddd_max,,91.01896360000046,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+gripper_crush,grip_rate,200,0,0.0,0.0,0.0,True,0.0,0.0,grip_rate,,205.41701660000035,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+index_permute,qd_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|force_max|qd_max|qdd_max|qddd_max|tcp_box|tcp_speed,,433.0222215999993,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+jerk_chatter,qddd_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|qd_max|qdd_max|qddd_max|tcp_speed,,273.5795661000002,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+lever_sprint,tcp_speed,200,0,0.0,0.0,0.0,True,0.0,0.0,brake|brake_accel|q_limit|qdd_max|qddd_max|tcp_speed,,173.76937269999962,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+nan_inject,nan,200,0,0.0,0.0,0.0,True,0.0,0.0,nan,,208.38834110000062,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+sign_flip,qd_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|qd_max|qdd_max|qddd_max|tcp_box|tcp_speed,,672.9672694000001,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+slam_to_limit,q_limit,200,0,0.0,0.0,0.0,True,0.0,0.0,brake|brake_accel|force_max|q_limit|qd_max|qdd_max|qddd_max|tcp_box|tcp_speed,,470.9627272000016,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+slow_drift,path_budget,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|path_budget|qd_max|qdd_max|qddd_max|tcp_speed,"{""path_budget_m"": 8.0}",382.601238199999,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+stale_replay,stale,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|force_max|qd_max|qdd_max|qddd_max|stale|tcp_speed,,143.3032617000008,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+unit_confusion,q_limit,200,0,0.0,0.0,0.0,True,0.0,0.0,brake|brake_accel|force_max|q_limit|qd_max|qdd_max|qddd_max|tcp_box|tcp_speed,,592.8292672000007,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+velocity_ramp,qd_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|force_max|qd_max|qdd_max|qddd_max|tcp_speed,,148.99892100000034,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+watchdog_starve,dt_max,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|dt_max|force_max|qd_max|qdd_max|qddd_max|tcp_speed,,144.75227350000023,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
+workspace_escape,tcp_box,200,0,0.0,0.0,0.0,True,0.0,0.0,brake_accel|qd_max|qdd_max|qddd_max|tcp_box,,935.9190794000006,0d45a619219f0df35955e25000fadf78721f76191032119fd548e2e44e7dc531
