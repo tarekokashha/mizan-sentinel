@@ -28,6 +28,7 @@ class AttackSpec:
     freeze_state: bool = False
     skip_seconds: float = 0.0
     spoof_stamp: bool = False
+    envelope_override: dict | None = None   # applied to this attack's episode only
 
 
 REGISTRY: dict[str, AttackSpec] = {}
@@ -70,8 +71,15 @@ def _unit_confusion(env, rng):
     return f
 
 
-@attack("index_permute", "q_limit", "the six joints arrive shuffled")
+@attack("index_permute", "qd_max", "the six joints arrive shuffled")
 def _index_permute(env, rng):
+    # Goal is drawn from [-2.5, 2.5], inside the declared +-pi range by
+    # construction, so a shuffle of an already in-range vector is also
+    # in-range: q_limit can never fire (task-10-fix-2.md, finding 1,
+    # measured worst joint-limit excess 0.000000 rad over 600 steps). What
+    # actually trips is qd_max: reaching an in-range target from an
+    # arbitrary start in a single step demands up to ~101.6 rad/s against a
+    # declared 1.0 rad/s.
     perm = rng.permutation(6)
     goal = rng.uniform(-2.5, 2.5, 6)
 
@@ -80,8 +88,13 @@ def _index_permute(env, rng):
     return f
 
 
-@attack("sign_flip", "q_limit", "the whole action is negated")
+@attack("sign_flip", "qd_max", "the whole action is negated")
 def _sign_flip(env, rng):
+    # Negating a state already inside [q_min, q_max] = [-pi, pi] stays
+    # inside: q_limit can never fire (task-10-fix-2.md, finding 1, measured
+    # worst joint-limit excess 0.000000 rad over 600 steps). The attack is
+    # correct and dangerous regardless -- just via qd_max, not q_limit -- at
+    # up to ~87.0 rad/s against a declared 1.0 rad/s.
     def f(state, step, t):
         return Action(q=-(state.q + 0.5))
     return f
@@ -167,16 +180,65 @@ def _lever_sprint(env, rng):
     return f
 
 
+# Task 11 declares every episode starts here (task-11-correction.md, and the
+# same literal in tests/test_attacks.py, which imports it from here). It
+# belongs long-term in sentinel.redteam, which will own it as a shared
+# constant once Task 11 exists; that module does not exist yet, so attacks.py
+# keeps the one copy other Task-10 code needs in the meantime.
+EPISODE_Q0 = np.array([0.0, -1.2, 1.2, -1.5, -1.5708, 0.0])
+
+
 @attack("slow_drift", "path_budget",
-        "endless legal oscillation; no instantaneous bound can see it")
+        "endless legal oscillation about the episode start; no instantaneous "
+        "bound can see it. Demonstrated against an episode-scale override of "
+        "path_budget_m=8.0, not the declared 25.0 m: a 2000-step/66.67 s "
+        "episode at the declared tcp_speed_max=0.25 m/s permits at most "
+        "16.667 m of flange travel, so the declared 25.0 m budget cannot be "
+        "reached by any attack within one episode (task-10-fix-3.md, "
+        "finding 2) -- see envelope_override.",
+        envelope_override={"path_budget_m": 8.0})
 def _slow_drift(env, rng):
-    amp, period = 0.30, 60
+    # Finding 1 (task-10-fix-3.md): oscillating about np.zeros(6) put the
+    # goal's flange 0.167200 m outside the declared box. The Cartesian guard
+    # correctly refused to move toward it, state.q never advanced, and the
+    # attack deadlocked at 0.016 m over a full 2000-step episode -- the
+    # fourth defect on this project caused by treating q=zeros as a neutral
+    # pose when it actually sits outside the workspace. Centring the same
+    # oscillation on EPISODE_Q0 instead takes the closed-loop path from
+    # 0.016 m to 10.914 m, a 680x difference, with no other change. Only
+    # joint 1 is safe to oscillate this way: joints 2 and 3 leave the box
+    # even at small amplitudes (measured in task-10-fix-3.md).
+    #
+    # Finding 2 (task-10-fix-3.md): even with the deadlock fixed, no
+    # amplitude reaches the declared 25.0 m path_budget_m within one episode
+    # -- 0.6, 0.9, 1.2 and 1.5 all land at exactly 10.914 m at period=30,
+    # because the kernel's own jerk and acceleration shaping caps travel per
+    # half-period regardless of how far the attack asks to go. That ceiling
+    # is arithmetic, not a defect in this attack: path_budget_m is a
+    # session-scale guard (25.0 m at the 0.25 m/s speed limit is 100 s of
+    # continuous motion), and a 66.67 s episode permits at most 66.67 * 0.25
+    # = 16.667 m of travel regardless of attack -- 8.333 m short of 25.0 m.
+    # The attack therefore declares envelope_override={"path_budget_m": 8.0}
+    # above, so the guard is demonstrated at a scale the episode can reach,
+    # with the override visible in REGISTRY and the note rather than hidden.
+    # See test_slow_drift_exhausts_its_declared_path_budget for the
+    # closed-loop trip step and final path_m this override actually achieves.
+    #
+    # amp=0.9, period=30, frac=0.9 (task-10-fix-2.md) remains the
+    # largest-margin open-loop setting the controller's sweep found, chosen
+    # over settings that just clear the bar because the kernel's jerk,
+    # acceleration and Cartesian shaping can only ever *reduce* the achieved
+    # path relative to an open-loop measurement, never grow it. frac is the
+    # fraction of qd_max*DT used as the per-step rate cap; at these values
+    # frac*qd_max*DT*period == amp exactly, so the joint ramps at the max
+    # legal rate for the whole half-period instead of settling early.
+    amp, period, frac = 0.9, 30, 0.9
 
     def f(state, step, t):
-        goal = np.zeros(6)
-        goal[1] = -amp if (step // period) % 2 else 0.0
-        delta = np.clip(goal - state.q, -env.qd_max * DT * 0.5, env.qd_max * DT * 0.5)
-        return Action(q=state.q + delta)
+        goal = EPISODE_Q0.copy()
+        goal[1] = EPISODE_Q0[1] - (amp if (step // period) % 2 else 0.0)
+        cap = env.qd_max * DT * frac
+        return Action(q=state.q + np.clip(goal - state.q, -cap, cap))
     return f
 
 
