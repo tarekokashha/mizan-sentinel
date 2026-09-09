@@ -262,7 +262,14 @@ def _slow_drift(env, rng):
 def _force_grind(env, rng):
     def f(state, step, t):
         q = state.q.copy()
-        q[1] += 0.02                      # push the shoulder down into the plane
+        # Joint 2, not joint 1. Sweeping the shoulder drives the flange into
+        # the box's X-wall at x = -0.65 while still at z of about 0.43, and the
+        # Cartesian guard freezes it there, so the contact plane is never
+        # touched and force_max never fires. Measured closed loop: joint 1
+        # bottoms out at z = 0.4257 and sticks by step 54; joint 2 reaches
+        # z = 0.0625, well under the z = 0.10 plane, and trips force_max at
+        # step 180 with 40.21 N against the 40.0 N limit.
+        q[2] += 0.02
         return Action(q=q)
     return f
 

@@ -1,11 +1,14 @@
 import numpy as np
 import pytest
 
-from sentinel.attacks import REGISTRY
+from sentinel.attacks import EPISODE_Q0, REGISTRY, build_all
 from sentinel.envelope import Envelope
 from sentinel.journal import verify
+from sentinel.kernel import SafetyKernel
 from sentinel.kinematics import tcp_position
-from sentinel.redteam import EPISODE_Q0, run_all, run_attack, run_episode
+from sentinel.redteam import run_all, run_attack, run_episode
+from sentinel.sim import PlaneContact, SimPlant
+from sentinel.types import Status
 
 
 def test_no_attack_escapes_the_envelope():
@@ -15,48 +18,19 @@ def test_no_attack_escapes_the_envelope():
     assert failed == [], f"attacks escaped the envelope: {failed}"
 
 
-# Measured, real, out-of-scope finding: force_grind (sentinel/attacks.py) never
-# trips force_max. Its q[1] += 0.02 sweep from EPISODE_Q0 drives the flange's
-# X coordinate past box.lo[0] = -0.65 at q1 ~= -1.155 (tcp.x reaches -0.651)
-# while tcp.z is still ~0.43 -- far short of the z=0.10 contact plane the
-# attack is aimed at (that plane needs only 5 mm of penetration at
-# stiffness=8000 N/m to reach force_max=40 N, so it is not a matter of
-# insufficient episode length). The Cartesian guard's bisection then
-# permanently holds q1 at that X boundary: `ok(q_ref)` is always true (zero
-# motion implies zero speed), so lo=0 is always "known good" and, once every
-# tested nonzero fraction toward the requested q_cmd also crosses the same X
-# wall, bisection converges to q_out = q_ref forever. Verified directly
-# against the real, unmodified SafetyKernel and SimPlant across the full
-# 2000-step budget, independent of run_episode -- this is not a bug in this
-# runner. It is not an escape either: the plant stays safely inside the box
-# throughout, since the guard that is blocking force_grind is doing its job.
-# force_grind's original design note (task-10-fix-3.md) claims the sweep
-# "drives the flange down to z = -0.479"; that number was evidently computed
-# open loop, watching z alone, the same class of mistake task-10-fix-3 itself
-# documents twice for other attacks -- ignoring what the sweep does on X.
-# Fixing force_grind's own strategy (a different start_q, a different joint
-# combination) needs the same measured-sweep rigor LEVER_POSTURE required and
-# is not one of task-11-correction.md's five authorised changes, so it is out
-# of scope here and is reported rather than guessed at.
-#
-# strict=True, matching tests/test_properties.py's existing
-# test_invariant_B_the_plant_stays_within_the_declared_margin: if force_grind
-# is ever fixed, this flips to an unexpected pass and fails loudly until the
-# marker below is removed, so the fix cannot go unnoticed.
-_KNOWN_SILENT_GUARDS = {
-    "force_grind": pytest.mark.xfail(
-        strict=True, reason="force_grind deadlocks against tcp_box on the X "
-        "axis at tcp.z~=0.43, never reaching the z=0.10 contact plane; see "
-        "the comment above this test and task-11-report.md"),
-}
-
-
-def _guard_case(name: str):
-    mark = _KNOWN_SILENT_GUARDS.get(name)
-    return pytest.param(name, marks=mark) if mark else name
-
-
-@pytest.mark.parametrize("name", [_guard_case(n) for n in sorted(REGISTRY)])
+# Previously known-silent (task-11-report.md, tracked under xfail(strict=True)
+# below): force_grind's q[1] += 0.02 shoulder sweep drove the flange's X
+# coordinate past box.lo[0] = -0.65 at q1 ~= -1.155 (tcp.x reaches -0.651)
+# while tcp.z was still ~0.43 -- far short of the z=0.10 contact plane -- and
+# the Cartesian guard's bisection permanently held q1 at that X boundary, so
+# force_max never fired. Fixed in task-11-fix-1.md, "Finding 2": sweeping
+# joint 2 instead of joint 1 reaches z = 0.0625, well under the plane, and
+# trips force_max against the unmodified declared envelope (no override
+# needed). See test_force_grind_trips_force_max_against_the_declared_plane
+# below for the closed-loop step and force this now produces. No attack in
+# this catalogue is known-silent any longer, so this parametrization is a
+# fully positive assertion with no exceptions.
+@pytest.mark.parametrize("name", sorted(REGISTRY))
 def test_every_attack_actually_trips_the_guard_it_declared(name):
     # A suite where nothing fires is a suite that proves nothing.
     #
@@ -74,6 +48,66 @@ def test_every_attack_actually_trips_the_guard_it_declared(name):
     assert r.expected_guard_fired, (
         f"{name} expected {REGISTRY[name].expect} and it never fired; "
         "the attack is not exercising the guard it claims to")
+
+
+def test_force_grind_trips_force_max_against_the_declared_plane():
+    # task-11-fix-1.md, "Finding 2": force_grind's original joint-1 sweep
+    # never reached the contact plane closed loop -- it deadlocked against
+    # the workspace box's X-wall at tcp.z ~= 0.43, far short of z = 0.10, so
+    # force_max never fired (see the note above
+    # test_every_attack_actually_trips_the_guard_it_declared). Sweeping
+    # joint 2 instead was measured to reach z = 0.0625, well under the
+    # plane, and to trip force_max at step 180 with 40.21 N against the
+    # 40.0 N limit -- against the declared PlaneContact(z=0.10) and the
+    # unmodified declared envelope, no override needed. This proves that
+    # measurement through the real, unmodified SafetyKernel and SimPlant,
+    # not by inspecting the raw action: the same class of open-loop mistake
+    # this project has now made four times (task-11-fix-1.md).
+    env = Envelope.ur5e_declared()
+    assert REGISTRY["force_grind"].envelope_override is None, (
+        "force_grind should trip its declared guard against the unmodified "
+        "declared envelope -- an override here would be a weaker result")
+
+    class Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+        def tick(self, dt=1.0 / 30.0):
+            self.t += dt
+
+    clock = Clock()
+    kernel = SafetyKernel(env, clock=clock)
+    contact = PlaneContact(z=0.10, stiffness=8000.0)
+    plant = SimPlant(q0=EPISODE_Q0, qdd_max=env.qdd_max, contact=contact, seed=0)
+    fn = build_all(env, np.random.default_rng(0))["force_grind"]
+
+    tripped_at, tripped_force = None, None
+    for i in range(2000):
+        state = plant.state(t_mono=clock.t)
+        v = kernel.filter(state, fn(state, i, clock.t))
+        if v.status is Status.STOP and any(x.rule == "force_max" for x in v.violations):
+            tripped_at = i
+            tripped_force = [x.measured for x in v.violations if x.rule == "force_max"][0]
+            break
+        plant.step(v.action.q, 1.0 / 30.0)
+        clock.tick()
+
+    assert tripped_at is not None, (
+        "force_grind never tripped force_max in 2000 steps against the "
+        "declared contact plane")
+    assert tripped_force > env.force_max, (
+        f"force_max fired but the measured force {tripped_force} did not "
+        f"exceed the declared limit {env.force_max}")
+    # Not a session-scale guard like slow_drift's path_budget: this should
+    # fire early, well inside even a --quick run's 300-step budget. Measured
+    # at step 180 with 40.21 N; a generous margin around that guards against
+    # incidental drift without pinning brittle exact values.
+    assert tripped_at < 300, (
+        f"force_grind tripped force_max at step {tripped_at}, far later "
+        "than the measured step 180 -- investigate before trusting the fix")
 
 
 def test_the_escape_rate_carries_an_anytime_valid_interval():
