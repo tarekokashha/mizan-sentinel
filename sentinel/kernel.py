@@ -16,6 +16,7 @@ from typing import Callable
 import numpy as np
 
 from sentinel.envelope import Envelope
+from sentinel.kinematics import tcp_position
 from sentinel.types import Action, RobotState, Status, Verdict, Violation
 
 
@@ -172,6 +173,52 @@ class SafetyKernel:
         self._qd_cmd = qd_real
         return q_cmd, v
 
+    def _cartesian(self, q_ref, q_cmd, dt) -> tuple[np.ndarray, list[Violation]]:
+        """Shorten the step until the flange is inside the box and slow enough.
+
+        Bisection returns the largest fraction it actually tested, never an
+        interpolated one, so the emitted command is always known-good rather
+        than believed-good. The one exception is q_ref itself: if the arm is
+        already outside the box, no fraction is tested at all -- see below.
+        """
+        env = self.env
+        p_ref = tcp_position(q_ref)
+
+        if env.tcp_box.excursion(p_ref) > 0.0:
+            # Already outside. Motion cannot fix this and a shortened step
+            # would be a guess, so hold and report. This is the one case
+            # where the returned fraction is not a tested one, and it is
+            # zero (task-6-7-resume.md: the latent gap where lo = 0.0 was
+            # seeded as known-good and never actually tested).
+            return q_ref.copy(), [Violation("tcp_box", env.tcp_box.excursion(p_ref), 0.0)]
+
+        def ok(q) -> bool:
+            p = tcp_position(q)
+            if env.tcp_box.excursion(p) > 0.0:
+                return False
+            return float(np.linalg.norm(p - p_ref)) / dt <= env.tcp_speed_max
+
+        if ok(q_cmd):
+            return q_cmd, []
+
+        lo, hi = 0.0, 1.0                      # lo is known good, hi is bad
+        for _ in range(env.bisect_iters):
+            mid = 0.5 * (lo + hi)
+            if ok(q_ref + mid * (q_cmd - q_ref)):
+                lo = mid
+            else:
+                hi = mid
+        q_out = q_ref + lo * (q_cmd - q_ref)
+        p_bad = tcp_position(q_cmd)
+        v = []
+        exc = env.tcp_box.excursion(p_bad)
+        if exc > 0.0:
+            v.append(Violation("tcp_box", exc, 0.0))
+        sp = float(np.linalg.norm(p_bad - p_ref)) / dt
+        if sp > env.tcp_speed_max:
+            v.append(Violation("tcp_speed", sp, env.tcp_speed_max))
+        return q_out, v
+
     # ---- the decision ----------------------------------------------------- #
     def filter(self, state: RobotState, action: Action) -> Verdict:
         env = self.env
@@ -252,10 +299,22 @@ class SafetyKernel:
             return self._hold(q_now, v, dt_raw)
 
         # 5. kinematic shaping
-        q_cmd, viols = self._shape(self._q_cmd, np.asarray(action.q, dtype=float), dt)
+        q_ref = self._q_cmd.copy()
+        q_cmd, viols = self._shape(q_ref, np.asarray(action.q, dtype=float), dt)
+
+        # 6. cartesian box and TCP speed, by conservative bisection
+        q_cmd, cviols = self._cartesian(q_ref, q_cmd, dt)
+        viols = list(viols) + list(cviols)
+        if cviols:
+            # the step was shortened after shaping; resynchronise the
+            # derivative state or the next call inherits a velocity the arm
+            # was never given
+            qd_real = (q_cmd - q_ref) / dt
+            self._qdd_cmd = (qd_real - self._qd_cmd) / dt
+            self._qd_cmd = qd_real
         self._q_cmd = q_cmd
         status = Status.CLAMPED if viols else Status.PASS
-        # guards 6 to 9 arrive in later tasks
+        # guards 7 to 9 arrive in later tasks
         return Verdict(status, Action(q=q_cmd.copy(), gripper=action.gripper),
                        tuple(viols), dt,
-                       {"qd_cmd": self._qd_cmd.copy(), "qdd_cmd": self._qdd_cmd.copy()})
+                       {"qd_cmd": self._qd_cmd.copy(), "tcp": tcp_position(q_cmd)})

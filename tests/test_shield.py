@@ -23,12 +23,23 @@ from sentinel.sim import SimPlant
 from sentinel.types import Status
 
 
+# Task 6 correction / task-6-7-resume.md: q0 = zeros sits 0.1672 m outside
+# the declared tcp_box, so once the Task 6 Cartesian guard is active a
+# kernel seeded there holds instead of moving, and
+# test_the_shield_forwards_a_legal_action_unchanged failed as a result. Seed
+# the plant at a pose verified inside the box instead. Only that one test
+# needs it -- the others assert refusals and are unaffected either way -- but
+# seeding once for the whole file is cleaner than special-casing.
+SHIELD_Q0 = np.array([0.0, -1.2, 1.2, -1.5, -1.5708, 0.0])
+# tcp = [-0.638607, -0.1333, 0.452214], excursion 0.0, inside the declared box.
+
+
 class FakeRobot:
     """Minimal stand-in with the LeRobot follower shape."""
 
     def __init__(self):
         self.env = Envelope.ur5e_declared()
-        self.plant = SimPlant(q0=np.zeros(6), qdd_max=self.env.qdd_max)
+        self.plant = SimPlant(q0=SHIELD_Q0, qdd_max=self.env.qdd_max)
         self.t = 0.0
         self.sent = []
         self._connected = False
@@ -68,13 +79,25 @@ class Clock:
 
 
 def test_the_shield_forwards_a_legal_action_unchanged():
+    # Deviation from task-6-7-resume.md (see task-6-7-report.md): the note
+    # only says to seed the plant at SHIELD_Q0; it doesn't say the two
+    # actions below also need to change. The original test sent zeros (a
+    # no-op from the old q0 = zeros) and then full(6, 1e-4) -- an absolute
+    # target that was a tiny nudge FROM zeros, but from SHIELD_Q0 it is a
+    # jump of over a radian on several joints, which the kernel correctly
+    # rate-limits, so the test failed for a new reason even after the seed
+    # fix. Mirrors test_kernel_cartesian.py's
+    # test_a_step_that_is_already_inside_is_not_shortened: first action is a
+    # no-op at the actual start pose, second is a genuinely tiny delta from
+    # it.
     r = FakeRobot()
     s = Shield(r, SafetyKernel(r.env, clock=Clock(r)))
     s.get_observation()
-    s.send_action({"joint_position": np.zeros(6)})
+    s.send_action({"joint_position": SHIELD_Q0})
     s.get_observation()
-    out = s.send_action({"joint_position": np.full(6, 1e-4)})
-    assert np.allclose(out["joint_position"], np.full(6, 1e-4), atol=1e-9)
+    target = SHIELD_Q0 + 1e-4
+    out = s.send_action({"joint_position": target})
+    assert np.allclose(out["joint_position"], target, atol=1e-9)
 
 
 def test_the_shield_stops_a_non_finite_action_before_the_robot_sees_it():

@@ -11,7 +11,7 @@ derivative up so acceleration can return to zero before velocity saturates.
 import numpy as np
 import pytest
 
-from sentinel.envelope import Envelope
+from sentinel.envelope import DATASHEET_TCP_SPEED_M_S, Box, Envelope
 from sentinel.kernel import SafetyKernel
 from sentinel.types import Action, RobotState, Status
 
@@ -30,18 +30,58 @@ class Clock:
         return self.t
 
 
+# Task 6 correction / task-6-7-resume.md: these tests are unit tests for the
+# joint-space shaping chain (jerk, acceleration, velocity, the braking
+# bound), and they ramp every joint toward +-pi to exercise the position
+# limit and the braking bound. q = +-pi on every joint is inside the
+# declared tcp_box, but the path there is not, so once Task 6 added the
+# Cartesian guard it stopped the ramp long before any joint limit was
+# approached and these tests could no longer do their job -- five of them
+# failed, all from the same cause (q = zeros starts 0.1672 m outside the
+# declared box; see task-6-7-resume.md for the controller's measurement).
+#
+# Deviation from task-6-7-resume.md (see task-6-7-report.md for the full
+# investigation): the note's prescribed fix -- give `run()` an unbounded
+# tcp_box and keep going through `k.filter(...)` -- is not sufficient.
+# _cartesian also enforces tcp_speed_max, and q = zeros is a near-maximal
+# lever (tcp radius 0.8497 m, close to the full 0.85 m reach). Measured with
+# only the box widened: the Cartesian guard still bound on every one of a
+# 5-step ramp's steps at the default 0.25 m/s speed limit. Widening
+# tcp_speed_max to the UR5e datasheet ceiling (1.0 m/s, the most this
+# Envelope will accept -- see envelope.py's own validation) is not enough
+# either: with all six joints ramping toward the same full-scale target
+# simultaneously from a near-maximal lever, measured combined TCP speed
+# reaches ~1.19 m/s during the early acceleration phase, still over even
+# that ceiling, for roughly the first 45-50 of a 400-step run. A bisected
+# step is a position discontinuity a finite-difference reconstruction of
+# jerk cannot tell apart from a real violation, so any test asserting a
+# bound over the *whole* trajectory (not just its tail, and not just "did
+# this rule fire somewhere") breaks.
+#
+# _shape has no dependency on tcp_box or tcp_speed_max at all -- it only
+# reads the q/qd/qdd/qddd limits and brake_headroom -- so `run()` now calls
+# it directly and never invokes `_cartesian`. That is what "isolate the
+# joint-space shaping chain" means literally, and it removes any doubt about
+# whether a given assertion happens to be insensitive to the interference
+# rather than genuinely unaffected by it. The Cartesian guard has its own
+# tests in test_kernel_cartesian.py.
+def _unbounded_box_env():
+    return Envelope.ur5e_declared().replace(
+        tcp_box=Box(lo=[-10.0, -10.0, -10.0], hi=[10.0, 10.0, 10.0]),
+        tcp_speed_max=DATASHEET_TCP_SPEED_M_S)
+
+
 def run(actions, q0=None, env=None):
-    """Drive the kernel with a list of targets. Returns the emitted commands."""
-    env = env or Envelope.ur5e_declared()
-    c = Clock()
-    k = SafetyKernel(env, clock=c)
+    """Drive the shaping chain alone with a list of targets, calling _shape
+    directly so _cartesian is never in the loop. Returns the emitted
+    commands."""
+    env = env or _unbounded_box_env()
+    k = SafetyKernel(env)
     q = np.zeros(6) if q0 is None else np.asarray(q0, dtype=float)
     out = []
     for a in actions:
-        v = k.filter(RobotState(q=q, qd=np.zeros(6), t_mono=c.t), Action(q=a))
-        out.append(v.action.q.copy())
-        q = v.action.q.copy()          # perfect follower, isolates the kernel
-        c.tick()
+        q, _ = k._shape(q, np.asarray(a, dtype=float), DT)
+        out.append(q.copy())
     return np.array(out), k, env
 
 
@@ -107,7 +147,7 @@ def test_braking_distance_is_respected_throughout_the_approach():
 
 
 def test_an_already_legal_action_passes_through_unchanged():
-    env = Envelope.ur5e_declared()
+    env = _unbounded_box_env()
     c = Clock()
     k = SafetyKernel(env, clock=c)
     q = np.zeros(6)
@@ -126,6 +166,13 @@ def test_degrees_sent_into_a_radians_api_are_contained():
 
 
 def test_alternating_full_scale_targets_do_not_produce_unbounded_jerk():
+    # Every-step full-reversal targets are the most adversarial input to
+    # _shape in this file (verified during development: even at the
+    # datasheet-max 1.0 m/s tcp_speed_max, going through _cartesian bound 15
+    # of 200 steps and produced an apparent max|qddd| = 245.9 against the
+    # 100.0 limit purely from the resulting position discontinuities, even
+    # though _shape's own bookkeeping never exceeds it -- run() now calls
+    # _shape directly for exactly this reason; see its docstring).
     actions = [np.full(6, 10.0 if i % 2 == 0 else -10.0) for i in range(200)]
     cmds, _, env = run(actions)
     qd = np.diff(np.vstack([np.zeros(6), cmds]), axis=0) / DT
@@ -159,15 +206,20 @@ def test_brake_accel_violation_fires_during_the_braking_transition():
     # "brake_accel" now fires somewhere in the same 400-step approach that
     # exercises the position-level "brake" clamp -- it engages early, while
     # velocity is still ramping toward qd_max, not near the wall.
-    env = Envelope.ur5e_declared()
-    c = Clock()
-    k = SafetyKernel(env, clock=c)
+    #
+    # Calls _shape directly (see run()'s docstring for why): going through
+    # filter()/_cartesian for a 400-step full-scale ramp from q = zeros lets
+    # the Cartesian speed guard bind during the early acceleration phase
+    # (measured ~1.19 m/s against even the 1.0 m/s datasheet ceiling), which
+    # would mix "tcp_speed" violations into rules_seen and, via the
+    # resynchronisation after every bisected step, drive this test's
+    # trajectory away from the one _shape alone would have produced.
+    env = _unbounded_box_env()
+    k = SafetyKernel(env)
     q = np.zeros(6)
     rules_seen = set()
     for _ in range(400):
-        v = k.filter(RobotState(q=q, qd=np.zeros(6), t_mono=c.t), Action(q=np.full(6, 10.0)))
-        rules_seen.update(viol.rule for viol in v.violations)
-        q = v.action.q.copy()
-        c.tick()
+        q, viols = k._shape(q, np.full(6, 10.0), DT)
+        rules_seen.update(v.rule for v in viols)
     assert "brake_accel" in rules_seen
     assert "brake" in rules_seen  # the position-level clamp still fires too
