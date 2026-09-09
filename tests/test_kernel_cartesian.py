@@ -4,7 +4,8 @@ import pytest
 from sentinel.envelope import Envelope
 from sentinel.kernel import SafetyKernel
 from sentinel.kinematics import tcp_position
-from sentinel.types import Action, RobotState
+from sentinel.sim import SimPlant
+from sentinel.types import Action, RobotState, Status
 
 DT = 1 / 30
 
@@ -136,3 +137,83 @@ def test_a_kernel_that_starts_outside_the_box_holds_rather_than_moving():
     assert viols[0].rule == "tcp_box"
     assert viols[0].limit == 0.0
     assert viols[0].measured == pytest.approx(env.tcp_box.excursion(tcp_position(q_ref)))
+
+
+# Task 9 property-test findings (invariant B, "the plant stays within the
+# declared margin"), reported DONE_WITH_CONCERNS in task-9-report.md and
+# ruled "property stated too strongly" rather than a kernel defect, pending
+# the controller's decision on how the precondition should be corrected --
+# see tests/test_properties.py's xfail'd
+# test_invariant_B_the_plant_stays_within_the_declared_margin for the live
+# property. `stoppable_states()` (task-9-correction.md section 1) bounds
+# q0/qd0 relative to JOINT-space room (q_max/q_min) only. It has no
+# relationship to the CARTESIAN tcp_box invariant (B) makes a claim about,
+# and two distinct ways that gap shows up are captured below, both against
+# the real SimPlant rather than the kernel's own commanded number (which
+# stays correct in both cases -- this is squarely about the physical plant).
+def test_a_plant_that_starts_outside_the_box_is_already_past_the_margin():
+    # Finding 1 (trivial): q0 = zeros sits 0.1672 m outside the declared box
+    # (progress.md Ruling R34, and test_the_tcp_never_leaves_the_declared_box
+    # above starts from a different, in-box posture for exactly this reason).
+    # The kernel correctly refuses to move an arm that starts outside the box
+    # (see test_a_kernel_that_starts_outside_the_box_holds_rather_than_moving
+    # above) -- but invariant B claims the PHYSICAL PLANT stays within
+    # plant_margin_m of the box, and the plant is *born* past it, before the
+    # kernel is ever called. No guard can retroactively relocate an arm that
+    # already starts somewhere.
+    env = Envelope.ur5e_declared()
+    q0 = np.zeros(6)
+    exc = env.tcp_box.excursion(tcp_position(q0))
+    assert exc == pytest.approx(0.1672, abs=1e-4)
+    assert exc > env.plant_margin_m, "test premise: q0 must start outside the margin"
+
+
+def test_a_joint_stoppable_velocity_can_still_carry_the_plant_past_the_cartesian_margin():
+    # Finding 2, the more interesting one: a velocity that is perfectly
+    # "stoppable" against ITS OWN joint limit (qd0**2 <= 2*qdd_max*room, the
+    # exact formula stoppable_states() uses) says nothing about whether the
+    # resulting TCP motion stays inside the Cartesian margin one control step
+    # later, because the Jacobian at a given configuration can turn a small
+    # joint excursion into a large TCP one -- the same reason this project
+    # has a whole separate Cartesian guard, and the same reason
+    # attacks.py's lever_sprint exists at all.
+    #
+    # q0 here sits exactly on the box surface (excursion 0.0, comfortably
+    # "inside" by invariant B's own margin test); qd0 asks only joint 0 to
+    # move at exactly qd_max = 1.0 rad/s, trivially stoppable against its own
+    # (huge) joint-limit room. The kernel is asked to hold position and does
+    # so exactly (status PASS, commanded q == q0) -- not a kernel defect. But
+    # the plant carries real momentum, and SimPlant's own physical settling
+    # (its saturated-acceleration servo taking one dt to arrest that
+    # momentum -- see sim.py's module docstring: "an infeasible command
+    # produces overshoot, so a kernel that clips position but ignores
+    # braking distance can actually be caught failing") moves the flange
+    # about 16 mm past the box surface in that single step, over 3x the 5 mm
+    # declared margin.
+    env = Envelope.ur5e_declared()
+    q0 = np.array([1.0, 2.75, 0.875, -2.0, 0.0, 0.0])
+    assert env.tcp_box.excursion(tcp_position(q0)) <= env.plant_margin_m, \
+        "test premise: q0 must start within the declared margin"
+    qd0 = np.array([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    room = np.minimum(env.q_max - q0, q0 - env.q_min)
+    cap = np.minimum(env.qd_max, np.sqrt(2.0 * env.qdd_max * np.maximum(room, 0.0)))
+    assert np.all(np.abs(qd0) <= cap + 1e-9), \
+        "test premise: qd0 must be joint-stoppable per stoppable_states()'s own formula"
+
+    c = Clock()
+    k = SafetyKernel(env, clock=c)
+    plant = SimPlant(q0=q0, qdd_max=env.qdd_max)
+    plant.qd = qd0.copy()
+    k.filter(plant.state(t_mono=c.t), Action(q=q0))
+    c.tick()
+    v = k.filter(plant.state(t_mono=c.t), Action(q=q0))       # ask it to hold
+    assert v.status is Status.PASS
+    assert np.allclose(v.action.q, q0)                        # the kernel did nothing wrong
+    plant.step(v.action.q, DT)
+
+    exc = env.tcp_box.excursion(tcp_position(plant.q))
+    assert exc == pytest.approx(0.01606, abs=1e-4)
+    assert exc > env.plant_margin_m, (
+        "expected the plant's own inertia to carry it past the margin; if "
+        "this now holds, invariant B's gap may already be closed and the "
+        "DONE_WITH_CONCERNS ruling in task-9-report.md should be revisited")

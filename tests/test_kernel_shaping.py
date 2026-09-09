@@ -223,3 +223,43 @@ def test_brake_accel_violation_fires_during_the_braking_transition():
         rules_seen.update(v.rule for v in viols)
     assert "brake_accel" in rules_seen
     assert "brake" in rules_seen  # the position-level clamp still fires too
+
+
+# Task 9 correction section 3 / progress.md Ruling R31: _brake_bound's room/dt
+# term keeps the final np.clip(q_ref + qd*dt, q_min, q_max) from ever biting
+# across this whole suite and all fifteen catalogued attacks -- but it is not
+# a universal guarantee, and tests/test_properties.py's hypothesis strategies
+# are exactly the kind of input that finds the gap: a start close to a joint
+# limit, carrying real velocity, driven by a fresh unconstrained target every
+# step. These two tests are the wiring check for
+# telemetry["position_clip_engaged"] (added to _shape/filter for exactly this
+# task): False during ordinary operation, True on the one step that actually
+# clips.
+def test_position_clip_engaged_is_false_during_an_ordinary_ramp():
+    cmds, k, env = run([np.full(6, 10.0)] * 5)
+    assert k._position_clip_engaged is False
+
+
+def test_position_clip_engaged_is_true_exactly_on_the_step_that_bites():
+    # Hand-searched, deterministic instance of the "stoppable start +
+    # random-walk target" family that tests/test_properties.py drives at
+    # scale (seed 199), verified against the real kernel to trip the clip on
+    # its 14th _shape call and nowhere earlier. Joint 5 lands exactly on
+    # q_max, having consumed its last ~5.6 mrad of room in the clip -- the
+    # same "about 5 mm" order of magnitude task-9-correction.md measured.
+    env = Envelope.ur5e_declared()
+    rng = np.random.default_rng(199)
+    q = rng.uniform(-2.8, 2.8, 6)
+    room = np.minimum(env.q_max - q, q - env.q_min)
+    cap = np.minimum(env.qd_max, np.sqrt(2.0 * env.qdd_max * np.maximum(room, 0.0)))
+    qd0 = rng.uniform(-1.0, 1.0, 6) * cap
+
+    k = SafetyKernel(env)
+    k._qd_cmd = qd0.copy()          # seed the derivative state directly;
+    for i in range(14):             # _shape has no other way to accept qd0
+        target = rng.uniform(-50, 50, 6)
+        q, _ = k._shape(q, target, DT)
+        if i < 13:
+            assert k._position_clip_engaged is False, f"clip engaged early, at step {i}"
+    assert k._position_clip_engaged is True, "expected this scenario to trip the clip by call 14"
+    assert q[5] == pytest.approx(env.q_max[5], abs=1e-9)

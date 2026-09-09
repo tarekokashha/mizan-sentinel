@@ -39,6 +39,7 @@ class SafetyKernel:
         self._qdd_cmd = np.zeros(6)
         self._grip_cmd: float | None = None
         self._tcp_prev: np.ndarray | None = None
+        self._position_clip_engaged = False
         self._stale_n = 0
         self._tripped = False
         self._trip_reason = ""
@@ -159,7 +160,21 @@ class SafetyKernel:
 
         qdd = np.clip(self._qdd_cmd + qddd * dt, -env.qdd_max, env.qdd_max)
         qd = np.clip(self._qd_cmd + qdd * dt, -env.qd_max, env.qd_max)
-        q_cmd = np.clip(q_ref + qd * dt, env.q_min, env.q_max)
+        q_pre_clip = q_ref + qd * dt
+        q_cmd = np.clip(q_pre_clip, env.q_min, env.q_max)
+        # Task 9 correction section 3 / progress.md Ruling R31: the room/dt
+        # term in _brake_bound keeps this clip from biting across the whole
+        # test suite and all fifteen catalogued attacks, but it is not a
+        # universal guarantee -- a fresh adversarial target on every step
+        # (exactly what tests/test_properties.py generates) can still request
+        # a qd that overshoots room in one step. Position safety is
+        # unconditional either way (q_cmd is always clipped, right above);
+        # what narrows on a step where this fires is the derivative
+        # guarantee, since qd_real ends up smaller than the qd the chain
+        # shaped. Exposed via telemetry so callers read the kernel's own
+        # behaviour instead of recomputing a guess against q_pre_clip/q_cmd
+        # themselves.
+        self._position_clip_engaged = bool(np.any(np.abs(q_pre_clip - q_cmd) > 1e-12))
 
         q_des_clipped = np.clip(q_des, env.q_min, env.q_max)
         if np.any(np.abs(q_des - q_des_clipped) > 1e-12):
@@ -319,6 +334,14 @@ class SafetyKernel:
             return self._hold(q_now, v, dt_raw)
 
         # 5. contact: excess force or torque stops outright, never shortens
+        #
+        # Contract: state.wrench must arrive already gravity- and
+        # payload-compensated. This kernel has no dynamics model and no I/O,
+        # so comparing the raw norm against force_max/torque_max is the only
+        # sound behaviour available to it -- it cannot tell the arm's own
+        # weight or a held payload's apart from an applied external force.
+        # A caller that wires in an uncompensated raw F/T sensor reading here
+        # silently defeats this guard; nothing downstream catches that.
         f = float(np.linalg.norm(state.wrench[:3]))
         t_norm = float(np.linalg.norm(state.wrench[3:]))
         if f > env.force_max:
@@ -370,4 +393,5 @@ class SafetyKernel:
         return Verdict(status, Action(q=q_cmd.copy(), gripper=g_out),
                        tuple(viols), dt,
                        {"qd_cmd": self._qd_cmd.copy(), "tcp": tcp_position(q_cmd),
-                        "path_m": self.path_m, "contact_s": self.contact_s})
+                        "path_m": self.path_m, "contact_s": self.contact_s,
+                        "position_clip_engaged": self._position_clip_engaged})
