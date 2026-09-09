@@ -218,3 +218,31 @@ def test_slow_drift_exhausts_its_declared_path_budget():
     assert tripped_at is not None, (
         f"slow_drift never exhausted the {env.path_budget_m} m override budget "
         f"in 2000 steps; reached {kernel.path_m:.3f} m")
+
+
+def test_every_declared_start_state_is_inside_the_envelope():
+    # task-11-correction.md #4: an attack may declare where its episode
+    # should start (lever_sprint does, because its joint-space ramp is not
+    # Cartesian-safe from EPISODE_Q0). A badly declared start_q must fail
+    # loudly rather than quietly, and this is the same check the red-team
+    # runner applies at step 0.
+    env = Envelope.ur5e_declared()
+    for name, spec in REGISTRY.items():
+        if spec.start_q is None:
+            continue
+        q = np.asarray(spec.start_q, dtype=float)
+        assert np.all(q <= env.q_max) and np.all(q >= env.q_min), name
+        assert env.tcp_box.excursion(tcp_position(q)) == 0.0, name
+
+
+def test_lever_sprint_declares_its_own_start_state():
+    # The general lesson (task-11-correction.md #4): a linear joint-space path
+    # between two Cartesian-safe configurations is not guaranteed to keep the
+    # intermediate path inside the box. Both endpoints being safe says
+    # nothing about the middle. lever_sprint's ramp from EPISODE_Q0 is legal
+    # in joint space but strays outside the box for 51 of its first 130
+    # steps, peaking 0.1237 m outside at call 41 -- so it must declare its
+    # own Cartesian-safe start rather than rely on the shared episode start.
+    spec = REGISTRY["lever_sprint"]
+    assert spec.start_q is not None, "lever_sprint must declare start_q"
+    assert np.array_equal(spec.start_q, np.concatenate(([0.0], LEVER_POSTURE)))

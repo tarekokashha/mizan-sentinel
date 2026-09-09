@@ -19,8 +19,18 @@ AttackFn = Callable[[RobotState, int, float], Action]
 DT = 1.0 / 30.0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AttackSpec:
+    # eq=False, matching RobotState/Action/Verdict in sentinel.types: a frozen
+    # dataclass with a numpy-array or dict field cannot use the default
+    # generated __eq__/__hash__ safely. hash((..., {"path_budget_m": 8.0}))
+    # already raised TypeError before this comment was written -- envelope_override
+    # made every AttackSpec that sets it unhashable the moment that field was
+    # added, and start_q below (an ndarray) would also make __eq__ raise
+    # "truth value of an array is ambiguous" on any spec that sets it. Nothing
+    # in this codebase compares or hashes an AttackSpec today, but leaving a
+    # dataclass with fields it cannot correctly compare or hash is a
+    # landmine for the next thing that does.
     name: str
     expect: str
     build: Callable[[Envelope, np.random.Generator], AttackFn]
@@ -29,6 +39,7 @@ class AttackSpec:
     skip_seconds: float = 0.0
     spoof_stamp: bool = False
     envelope_override: dict | None = None   # applied to this attack's episode only
+    start_q: np.ndarray | None = None       # seed the episode here instead of EPISODE_Q0
 
 
 REGISTRY: dict[str, AttackSpec] = {}
@@ -161,7 +172,8 @@ LEVER_POSTURE = np.array([-0.56, 0.32, 0.35, -1.5708, 0.0])
 
 @attack("lever_sprint", "tcp_speed",
         "fully extended base sweep at the legal joint speed; the lever arm, "
-        "not the joint rate, is what makes the flange fast")
+        "not the joint rate, is what makes the flange fast",
+        start_q=np.concatenate(([0.0], LEVER_POSTURE)))
 def _lever_sprint(env, rng):
     def f(state, step, t):
         q = state.q.copy()
@@ -181,10 +193,11 @@ def _lever_sprint(env, rng):
 
 
 # Task 11 declares every episode starts here (task-11-correction.md, and the
-# same literal in tests/test_attacks.py, which imports it from here). It
-# belongs long-term in sentinel.redteam, which will own it as a shared
-# constant once Task 11 exists; that module does not exist yet, so attacks.py
-# keeps the one copy other Task-10 code needs in the meantime.
+# same literal in tests/test_attacks.py, which imports it from here).
+# sentinel.redteam imports and re-exports this constant rather than
+# duplicating the literal; it stays defined here rather than moving there
+# because _slow_drift below needs it directly and redteam.py already imports
+# REGISTRY/AttackSpec from this module, so the reverse import would cycle.
 EPISODE_Q0 = np.array([0.0, -1.2, 1.2, -1.5, -1.5708, 0.0])
 
 
