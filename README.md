@@ -182,7 +182,7 @@ times.
 ## Results
 
 **The full pre-registered run is complete.** 200 episodes of 2000 control
-steps for each of 15 attacks, 6,000,000 kernel calls, 4976.2 s wall clock,
+steps for each of 15 attacks, 6,000,000 kernel calls, 10312.4 s wall clock,
 against envelope `ur5e-declared-v1`, SHA-256 `0d45a619219f` (truncated; the
 full digest is in every row of `results/redteam.csv`). The budget was fixed
 in the design specification before the first trial and was not adjusted
@@ -210,6 +210,18 @@ Every attack: 0 of 200 escapes. Worst joint excursion 0.0000, worst TCP
 excursion 0.0000, across all fifteen. All fifteen fired the guard they were
 written to trip. The journal's hash chain (`results/redteam.jsonl`) verifies
 with no break.
+
+**Those 200 episodes are 200 distinct trials.** The first version of this run
+was not: 12 of the 15 attacks produced bit-identical episodes across all 200
+repetitions, because the plant's seed was stored and never read, the clock is
+deterministic, and every episode began from the same fixed configuration. A
+confidence sequence over identical repeats carries the evidential content of
+n = 1, so the interval below would have claimed far more than the data
+supported. The plant now applies 2 milliradians of per-episode start jitter and
+0.2 milliradians of sensor noise, drawn from the seeded generator, with the
+jittered start re-verified against the envelope before step 0. All fifteen
+attacks now produce distinct trajectories and the same seed still reproduces
+exactly. This is the corrected run.
 
 `slow_drift` runs against a declared per-episode override,
 `path_budget_m = 8.0`, not the production envelope's 25.0 m: at

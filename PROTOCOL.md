@@ -147,7 +147,7 @@ No GPU. The kernel, the simulated plant, and the runner are pure Python plus
 numpy, and the full run was executed on the development machine's CPU alone.
 No cost was incurred beyond that machine's time. Wall-clock time is on the
 record: `results/redteam.csv`'s `wall_clock_s` column gives it per attack,
-summing to **4976.2 s** across the full 6,000,000-call run. No peak-memory
+summing to **10312.4 s** across the full 6,000,000-call run. No peak-memory
 assertion log exists for this run; nothing here approached a scale where one
 seemed necessary.
 
@@ -194,17 +194,17 @@ assuming more than it provides:
   Per-episode outcomes are not retained as an artefact. With zero escapes they
   are trivially reconstructible from the aggregate, so the numbers in section 11
   are unaffected, but a claim that per-episode records exist would be false.
-- **Every line carries an envelope SHA-256, and for one row it is the wrong
-  one.** The runner writes the production envelope's hash rather than the hash
-  of the envelope actually in force, which differs only for `slow_drift` and its
-  declared override. The override itself is disclosed in a separate text column,
-  so the attribution is not silent, but the machine-checkable half is wrong on
-  exactly the row it exists to protect. Recorded here rather than quietly
-  corrected after the fact.
-- **The chain detects mid-file tampering and mid-file deletion, but not
-  truncation of the tail.** There is no commitment to chain length, so dropping
-  trailing records verifies clean. That is the natural way to hide a late
-  escape, and it is a real gap in the guarantee this section claims.
+- **Every line carries the SHA-256 of the envelope that actually produced it.**
+  An earlier version of the runner wrote the production declaration's hash on
+  every row, misattributing the one row where they differ. The `slow_drift` row
+  now carries `704ecfcde56a`, the hash of its overridden envelope, while every
+  other row carries the production `0d45a619219f`. Both are in
+  `results/redteam.csv` and can be checked.
+- **The chain now commits to its own length.** An earlier version detected
+  mid-file tampering and mid-file deletion but not truncation of the tail, which
+  is the natural way to hide a late escape. `Journal.close()` writes a terminal
+  record and `verify()` requires the chain to end with it, so a truncated log no
+  longer verifies.
 
 ## 10. Deviations
 
@@ -241,12 +241,37 @@ never silent: it is printed in the runner's table and written to the
 `envelope_override` column of `results/redteam.csv`. What this demonstrates
 and what it does not demonstrate are both recorded in `LIMITATIONS.md`.
 
+**The declared run was executed twice, and the first execution is discarded.**
+A whole-branch review found that 12 of the 15 attacks produced bit-identical
+episodes across all 200 repetitions: the plant's seed was stored and never read,
+the control clock is deterministic, and every episode began from the same fixed
+configuration. The escape outcomes were therefore not 200 independent trials per
+attack but a single trial repeated, and any confidence sequence over them would
+have claimed far more than the data supported.
+
+This is recorded as a deviation rather than quietly overwritten because the
+discarded run reported the same headline, zero escapes, and it would have been
+easy to keep. It was not wrong about what it measured; it measured less than it
+appeared to.
+
+The correction realises what section 4 already declared rather than changing it:
+the plant now applies 2 milliradians of per-episode start jitter and 0.2
+milliradians of sensor noise, both drawn from the seeded generator, with the
+jittered start re-verified against the envelope before step 0 so an over-large
+jitter fails loudly rather than silently leaving the workspace. All fifteen
+attacks now produce distinct trajectories, and the same seed still reproduces
+exactly. The budget, the claim, the metric and the decision rule are unchanged.
+
+The run reported below is the corrected one. Its wall clock is more than double
+the discarded run's, 10312.4 s against 4976.2 s, because varied starts drive the
+attacks into the Cartesian guard's bisection far more often.
+
 ---
 
 ## Outcome (addendum, written after the run in section 2's declared budget)
 
 The full declared run completed: 200 episodes x 2000 steps x 15 attacks,
-6,000,000 kernel calls, 4976.2 s wall clock, against envelope
+6,000,000 kernel calls, 10312.4 s wall clock, against envelope
 `ur5e-declared-v1`, SHA-256 `0d45a619219f` (truncated; the full digest is in
 every row of `results/redteam.csv`). Every attack: **0 of 200 escapes**.
 Worst joint excursion 0.0000, worst TCP excursion 0.0000, across every
