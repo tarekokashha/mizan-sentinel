@@ -274,11 +274,16 @@ Reproduce the full run with:
 .\tasks.ps1 redteam
 ```
 
-or the quick five-episode smoke version CI runs on every push:
+or the quick five-episode smoke version:
 
 ```powershell
 .\tasks.ps1 quick
 ```
+
+CI does not invoke `tasks.ps1`. It runs `python -m pytest -q` and a clean-import
+check on Windows and Linux, and the suite itself contains a three-episode
+red-team smoke run (`test_no_attack_escapes_the_envelope`), so every push does
+exercise the runner, just not through that script.
 
 ---
 
@@ -286,15 +291,21 @@ or the quick five-episode smoke version CI runs on every push:
 
 Being precise about this is the point of the project.
 
-**Verified.** The kernel's guards, individually and composed, across 106 tests
+**Verified.** The kernel's guards, individually and composed, across 134 tests
 including property-based tests under `hypothesis` that drive the fully assembled
 kernel with adversarial input. Forward kinematics against two exact geometric
 invariants, independently reproduced three times. The hash chain against
-tampering, deletion, and re-attribution.
+mid-file tampering, mid-file deletion, and re-attribution. The full
+pre-registered red-team run, reported above.
 
 **Not verified.**
 
-- **No red-team escape rate exists.** The runner is not built.
+- **Five of the ten guards were never exercised by the red-team run.**
+  `contact_budget`, `torque_max`, `grip_range`, `tracking` and `latched` appear
+  in none of the fifteen result rows. The runner rearms after every stop, which
+  zeroes the cumulative budgets, so `contact_budget` in particular cannot
+  accumulate across an episode. A run that exercises half the guards should say
+  so, and this one does.
 - **No hardware, ever.** Every number here comes from a simulated plant. Passing
   in simulation is necessary and nowhere near sufficient.
 - **The Shield has never been composed with the driver it wraps.** That driver
@@ -308,14 +319,17 @@ tampering, deletion, and re-attribution.
 - **The kernel is in-process.** A crash of the calling process takes it with it.
   An out-of-process supervisor is the right answer and is not built.
 
-The invariant itself carries two stated narrowings. It holds only from a
-*stoppable* start, because a joint closer to its limit than its own velocity can
-brake within is committed to an overshoot before the kernel is ever called. And
-the derivative guarantee, though not the position guarantee, degrades on steps
-where the final position clip engages under adversarial input.
+Invariant (A) carries two stated narrowings. It holds only from a *stoppable*
+start, because a joint closer to its limit than its own velocity can brake
+within is committed to an overshoot before the kernel is ever called. And its
+derivative guarantee, though not its position guarantee, degrades on steps where
+the final position clip engages under adversarial input.
 
-`LIMITATIONS.md` will carry the full list with measured rates once the red-team
-run has happened.
+Invariant (B) is **refuted**, and its test is left failing on purpose. Joint
+space stoppability does not imply Cartesian stoppability.
+
+[`LIMITATIONS.md`](LIMITATIONS.md) carries the full list with the measured
+numbers. Read it before citing the result above.
 
 ---
 
@@ -331,12 +345,12 @@ sentinel/
   attacks.py      fifteen adversarial action generators
   shield.py       drop-in wrapper over any LeRobot-style follower
   journal.py      append-only hash-chained verdict log
-tests/            106 tests, including property-based tests
+tests/            134 tests, including property-based tests
 docs/superpowers/ design specification and implementation plan
 docs/decisions/   defect records: what was claimed, measured, and changed
 ```
 
-1248 lines of package code against 1984 lines of tests.
+1627 lines of package code against 2227 lines of tests.
 
 ### `docs/decisions/` is worth a look
 

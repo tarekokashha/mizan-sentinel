@@ -32,3 +32,12 @@ jobs:
 
       - name: Verify the package imports with no vendor SDK present
         run: python -c "import sentinel.kernel, sentinel.shield, sentinel.attacks; print('clean import ok')"
+
+      # Deliberately NOT running `python -m sentinel.redteam --quick` here yet.
+      # Its exit code currently gates on every declared guard having fired, and
+      # a 300-step quick run cannot reach guards whose timescale exceeds it:
+      # slow_drift's path budget needs roughly 1474 steps. So the step would be
+      # red for a reason that is not a failure. The suite already contains a
+      # three-episode red-team smoke run (test_no_attack_escapes_the_envelope),
+      # so the runner is exercised on every push regardless. Add this step once
+      # the exit code gates on escapes rather than on guard coverage.

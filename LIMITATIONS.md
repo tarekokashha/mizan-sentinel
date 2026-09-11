@@ -70,7 +70,7 @@ that one transition can exceed `qdd_max`. This is real and measured, not
 theoretical: driven with a fresh uniformly random target in `[-50, 50]` on
 every single step, unlike anything in the attack catalogue but exactly what
 `hypothesis` generates, the clip engaged **361 times across 200 random-walk
-trials, worst single-step magnitude about 5 mm**
+trials, worst single-step magnitude about 5 milliradians**
 (`docs/decisions/task-9-correction.md`, section 3, reproduced in the module
 docstring of `tests/test_properties.py`). `test_invariant_A_derivatives_hold_except_where_the_position_clip_engages`
 reports its own observed clip rate at run time via `hypothesis.note()`, tied

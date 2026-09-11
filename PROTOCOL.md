@@ -3,7 +3,8 @@
 Programme: M-01 SENTINEL
 Owner: Tarek
 Date committed: 2026-09-09
-Git hash of the harness at commit: <fill after commit>
+Git hash of the harness that produced the run in section 11: `cb82132`
+Git hash of the specification this protocol argues from: `8e8ed4d`
 
 **A note on sequencing, since it matters for what this document is worth.**
 This file is committed after the red-team run already completed, as the last
@@ -165,16 +166,45 @@ whole run in `sentinel/redteam.py`'s exit code:
 
 Neither occurred in this run. See the outcome section.
 
+**But the runner does intervene, once per stop, and it matters.** After any
+latching `STOP` the runner calls `rearm()` so the episode can continue, and
+`rearm` zeroes the cumulative budgets by design. The consequence is that
+`contact_budget` can never accumulate across an episode, and it fired in **zero**
+of the fifteen result rows. Nor did `torque_max`, `grip_range`, `tracking` or
+`latched`.
+
+So **five of the kernel's ten guards were not exercised by this run at all.**
+The result in section 11 is evidence about the five that were, plus the
+shaping chain underneath them. It is not evidence about the other five, which
+are covered only by unit tests. A run that exercises half the guards should say
+which half, and this is that statement.
+
 ## 9. Video and logging
 
-No video; there is no camera and nothing physical to record. In its place,
-every episode's summary is appended to a tamper-evident, hash-chained JSONL
-log (`sentinel/journal.py`), written to `results/redteam.jsonl` for this run,
-with `results/redteam.csv` as the tabular summary. Every line and every CSV
-row carries the SHA-256 of the envelope that produced it
-(`envelope_sha256`), so a result can never be silently attributed to the
-wrong declaration. The chain for this run was checked with
-`sentinel.journal.verify` and verifies with no break.
+No video; there is no camera and nothing physical to record. In its place, a
+tamper-evident, hash-chained JSONL log (`sentinel/journal.py`) is written to
+`results/redteam.jsonl`, with `results/redteam.csv` as the tabular summary.
+The chain was checked with `sentinel.journal.verify` and verifies with no
+break.
+
+Three limits of that record, stated because the alternative is a reader
+assuming more than it provides:
+
+- **It is one line per attack, not per episode.** The file has fifteen lines.
+  Per-episode outcomes are not retained as an artefact. With zero escapes they
+  are trivially reconstructible from the aggregate, so the numbers in section 11
+  are unaffected, but a claim that per-episode records exist would be false.
+- **Every line carries an envelope SHA-256, and for one row it is the wrong
+  one.** The runner writes the production envelope's hash rather than the hash
+  of the envelope actually in force, which differs only for `slow_drift` and its
+  declared override. The override itself is disclosed in a separate text column,
+  so the attribution is not silent, but the machine-checkable half is wrong on
+  exactly the row it exists to protect. Recorded here rather than quietly
+  corrected after the fact.
+- **The chain detects mid-file tampering and mid-file deletion, but not
+  truncation of the tail.** There is no commitment to chain length, so dropping
+  trailing records verifies clean. That is the natural way to hide a late
+  escape, and it is a real gap in the guarantee this section claims.
 
 ## 10. Deviations
 
