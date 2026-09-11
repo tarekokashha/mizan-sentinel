@@ -3,94 +3,199 @@
 **A safety kernel for the UR5e, and the adversarial suite that tries to break it.**
 
 SENTINEL sits between a robot policy and a robot arm. Every commanded motion
-passes through a pure, deterministic function that either lets it through,
-shortens it, holds position, or latches a stop. No action sequence, however
-malformed or hostile, is supposed to drive the arm outside a declared envelope.
+passes through one pure, deterministic function that lets it through, shortens
+it, holds position, or latches a stop. No action sequence, however malformed or
+hostile, is supposed to drive the arm outside a declared envelope.
 
-This is the enforcement half of M-01 in the MIZAN research programme. It exists
-because the programme's own operating contract forbids running adversarial
-instructions against hardware until such enforcement exists:
-
-> Never execute an adversarial instruction (M-01) outside URSim until the
-> controller enforces joint, velocity and force envelopes in hardware.
-
-This repository builds that gate. It does not walk through it.
+Fifteen adversarial attacks, 200 episodes each, six million control decisions:
+**nothing escaped.** What that does and does not prove is the rest of this page,
+and it matters more than the number.
 
 ---
 
 > ## Do not put this in front of a real arm
 >
-> **This code has never controlled hardware. Not once.** Every number in this
-> repository, including the zero-escape result below, comes from a simulated
-> plant, and every limit is declared rather than measured.
+> **This code has never controlled hardware. Not once.** Every number here,
+> including the zero-escape result, comes from a simulated plant, and every limit
+> is declared rather than measured.
 >
-> The red-team result makes that warning more important, not less. Fifteen
-> attacks failing to escape a simulator says the kernel resists the fifteen
-> attacks someone thought of, in a model of a robot. It says nothing about the
-> attack nobody thought of, and nothing at all about a real arm with real
-> compliance, real latency and real sensor noise. One of the two invariants this
-> project set out to establish is refuted and its test is left failing on
-> purpose.
+> The result makes this warning more important, not less. Fifteen attacks failing
+> to escape a simulator says the kernel resists the fifteen attacks someone
+> thought of, in a model of a robot. It says nothing about the attack nobody
+> thought of, and nothing at all about a real arm with real compliance, real
+> latency and real sensor noise. One of the two invariants this project set out
+> to establish is **refuted**, and its test is left failing on purpose.
 >
-> It is also in-process: a crash of the calling process takes the safety layer
-> with it. Real machine safety needs a supervisor the application cannot kill, a
-> hardware emergency stop, and limits derived from a hazard analysis of your
-> specific cell. This is none of those things.
->
-> Use it to study the problem, to test a policy in simulation, or as a starting
-> point you then validate yourself. Do not use it as the thing standing between
-> a person and a moving robot.
+> Real machine safety needs a supervisor the application cannot kill, a hardware
+> emergency stop, and limits derived from a hazard analysis of your specific
+> cell. This is none of those things. Use it to study the problem, to test a
+> policy in simulation, or as a starting point you then validate yourself.
 
 ---
 
-## Status
+## Contents
 
-**The kernel is complete and tested, and the full pre-registered red-team run
-is complete: zero escapes across 3000 episodes.**
-
-| component | state |
-|---|---|
-| `envelope` declared limits, provenance, content hash | complete, reviewed |
-| `kinematics` UR5e forward kinematics and Jacobian | complete, reviewed |
-| `journal` tamper-evident hash-chained log | complete, reviewed |
-| `kernel` all ten guards | complete, reviewed |
-| `sim` second-order servo plant | complete, reviewed |
-| `attacks` fifteen adversarial generators | complete |
-| `shield` drop-in wrapper | complete, reviewed |
-| property tests under `hypothesis` | complete, one invariant refuted on purpose (`xfail(strict=True)`) |
-| **`redteam` escape-rate runner** | **complete: 0/200 escapes per attack, 0/3000 pooled** |
-| **`PROTOCOL.md`, `LIMITATIONS.md`** | **written** |
-
-133 tests pass, plus one `xfail(strict=True)` that documents a refuted
-property rather than hiding it (see [Limitations](LIMITATIONS.md)). The
-red-team run is the one declared in [`PROTOCOL.md`](PROTOCOL.md) before any
-trial ran: 200 episodes of 2000 steps for each of 15 attacks, 6,000,000
-kernel calls, against envelope `ur5e-declared-v1`. Every attack fired the
-guard it was written to test and none escaped. The full table, the
-confidence sequences, and exactly what this result does and does not prove
-are in [Results](#results) below.
+- [Why it exists](#why-it-exists)
+- [How it works](#how-it-works): the pipeline, the ten guards, the envelope
+- [The attack catalogue](#the-attack-catalogue)
+- [Quick start](#quick-start)
+- [The result](#the-result)
+- [What is verified, and what is not](#what-is-verified-and-what-is-not)
+- [Repository layout](#repository-layout)
+- [How this was built](#how-this-was-built)
 
 ---
 
-## Why this exists
+## Why it exists
 
-The code this replaces is a single method, and it does not hold. Six defects,
-all reachable by an ordinary caller, none requiring an adversary:
+This is the enforcement half of M-01 in the MIZAN research programme. That
+programme's operating contract contains a gate:
 
-1. **The velocity clamp is wrong by the ratio of two rates.** It sizes the step
-   from the controller period (2 ms at 500 Hz) while being called at the policy
-   rate (about 33 ms at 30 Hz). Roughly sixteen times too tight, so the arm lags
-   rather than tracks, and nothing measures elapsed time.
-2. **No joint position limits at all.** Velocity is clamped; angle is not. A
-   patient caller reaches any configuration.
-3. **The force check is unsound.** It reads the sensor after computing the clamp,
-   takes a raw base-frame norm with no gravity or payload compensation, and on
-   trip calls `servoStop()` only: no protective stop, no latch, no re-arm.
-4. **No finiteness validation.** A NaN passes through `np.clip` unchanged and
-   reaches the servo.
-5. **No watchdog.** A stalled caller leaves the last command latched forever.
-6. **Nothing observes cumulative effect.** A sequence respecting every per-step
-   limit can still walk the arm out of the cell over a minute.
+> Never execute an adversarial instruction (M-01) outside URSim until the
+> controller enforces joint, velocity and force envelopes in hardware.
+
+No such enforcement existed. What existed was a single method, `send_action`, in
+a vendor driver skeleton, and it does not hold. Six defects, every one reachable
+by an ordinary caller, none requiring an adversary:
+
+| # | defect | consequence |
+|---|---|---|
+| 1 | Velocity clamp sized from the controller period (2 ms at 500 Hz) while called at the policy rate (33 ms at 30 Hz) | roughly **16x too tight**; the arm lags instead of tracking, and nothing measures elapsed time |
+| 2 | No joint position limits at all | velocity is clamped, angle is not; a patient caller reaches any configuration |
+| 3 | Force check reads the sensor after computing the clamp, uses a raw base-frame norm with no gravity or payload compensation, and calls `servoStop()` only | no protective stop, no latch, no defined re-arm |
+| 4 | No finiteness validation | a NaN passes through `np.clip` unchanged and reaches the servo |
+| 5 | No watchdog | a stalled caller leaves the last command latched forever |
+| 6 | Nothing observes cumulative effect | a sequence respecting every per-step limit still walks the arm out of the cell over a minute |
+
+This repository builds the gate. It does not walk through it: running the
+adversarial half is a separate programme with its own protocol.
+
+---
+
+## How it works
+
+```mermaid
+flowchart TD
+    P["policy / teleop / attack"] -->|"joint target"| S["Shield<br/>(drop-in wrapper)"]
+    S --> K["SafetyKernel.filter<br/>pure, deterministic, no I/O"]
+    K --> V{"Verdict"}
+    V -->|PASS| R["robot"]
+    V -->|CLAMPED<br/>shortened| R
+    V -->|HOLD<br/>current position| R
+    V -->|STOP<br/>latched until rearm| X["no motion"]
+    K -.->|"every decision"| J["hash-chained journal"]
+```
+
+The kernel performs **no I/O** and takes its clock **by injection**. That is what
+makes the whole thing deterministically testable, and it is why the property
+tests can drive six million decisions in a suite that runs in a minute.
+
+### Ten guards, in a fixed order
+
+The order is load bearing. Validation precedes any arithmetic on the numbers.
+Contact and budgets precede shaping, because both are reasons to stop outright
+rather than to shorten a step.
+
+| # | guard | what it catches | on trip |
+|---|---|---|---|
+| 0 | **latch** | anything, once already stopped | STOP until explicit `rearm(reason)` |
+| 1 | **validate** | NaN, infinity, wrong shape | latching STOP, no command emitted |
+| 2 | **staleness** | the driver's observation stopped advancing | HOLD, then STOP after 3 |
+| 3 | **timestep** | a control period longer than `max_dt_s` | HOLD |
+| 4 | **tracking** | the arm is not where it was last told to be | HOLD and resynchronise |
+| 5 | **contact** | force or torque past the declared limit | latching STOP |
+| 6 | **cumulative budgets** | endless legal motion; time spent in contact | latching STOP |
+| 7 | **kinematic shaping** | jerk, acceleration, velocity, braking distance, position | CLAMPED |
+| 8 | **Cartesian** | flange outside the workspace box, or too fast | CLAMPED by conservative bisection |
+| 9 | **gripper** | position out of range, or closing too fast | CLAMPED |
+
+### Two pieces worth reading the code for
+
+**The braking bound.** Clamping position and velocity independently is unsound
+under an acceleration limit: you clamp the target, the joint is still moving, and
+it decelerates through the wall because deceleration is finite. So velocity is
+additionally capped by a discrete-exact stopping bound, and **the same bound is
+applied one derivative up**, capping acceleration against remaining velocity
+headroom for exactly the same reason. Measured on the emitted command sequence,
+worst case over both directions and six seeded start states:
+
+| quantity | measured | declared limit |
+|---|---|---|
+| max abs velocity | 1.000000 | 1.0 rad/s |
+| max abs acceleration | 5.000000 | 5.0 rad/s² |
+| max abs jerk | 100.0000 | 100.0 rad/s³ |
+
+Each exactly at its limit, position held, arrival velocity `0.000000000`,
+reaching the joint limit from rest in 101 control steps. The first version of
+this chain produced 8.81 rad/s² against that 5.0 limit and 174.8 rad/s³ against
+100.0, and failed its own test.
+
+**The kernel keeps its own clock.** It never compares the driver's timestamp
+against its own and never trusts a caller-supplied timestep. On Windows,
+`time.monotonic()` and `time.perf_counter()` were measured **5.558460 seconds
+apart** on the development machine, and the UR driver stamps with
+`perf_counter`. A guard comparing them latches a permanent stop against a
+perfectly healthy arm. So staleness compares the driver's *successive* stamps to
+each other, which is epoch independent. The default clock is `perf_counter`,
+because `monotonic` on Windows is `GetTickCount64()` at **15.625 ms** resolution,
+roughly half a control period at 30 Hz, and the shaping chain divides by `dt`
+three times.
+
+### The declared envelope
+
+Every limit carries a `provenance` of `datasheet`, `declared`, or `measured`.
+**Nothing in this repository may write `measured`.** Loading an envelope that
+claims one without a named human and a date raises, and the rule is structural:
+`MappingProxyType` and read-only arrays mean it cannot be defeated after
+construction either.
+
+The declaration sits well inside the machine:
+
+| quantity | declared | UR5e datasheet |
+|---|---|---|
+| joint range | ±180° | ±360° |
+| joint speed | 1.0 rad/s | 3.14 rad/s |
+| flange speed | 0.25 m/s | ~1.0 m/s |
+| force | 40.0 N | (declared, no datasheet equivalent) |
+| acceleration / jerk | 5.0 rad/s² / 100.0 rad/s³ | declared outright |
+| workspace box | `[-0.65, -0.65, 0.05]` to `[0.65, 0.65, 0.90]` m | 850 mm reach |
+| watchdog / max `dt` | 0.2 s | declared |
+| path / contact budget | 25.0 m / 5.0 s | declared |
+
+Every envelope is content-hashed, and that hash is written into every journal
+line, so a result can never be attributed to the wrong declaration.
+
+---
+
+## The attack catalogue
+
+Fifteen generators, each declaring the guard it exists to trip. An attack that
+cannot reach its declared guard reports a clean run and proves nothing, so the
+suite asserts that every one fires.
+
+| attack | targets | what it does |
+|---|---|---|
+| `nan_inject` | `nan` | one joint goes non-finite |
+| `slam_to_limit` | `q_limit` | command far past every limit, every step |
+| `unit_confusion` | `q_limit` | degrees written into a radians field |
+| `index_permute` | `qd_max` | the six joints arrive shuffled |
+| `sign_flip` | `qd_max` | the whole action is negated |
+| `velocity_ramp` | `qd_max` | grow the requested step smoothly |
+| `dt_spoof` | `qd_max` | claim a tiny timestep to win a bigger step |
+| `jerk_chatter` | `qddd_max` | full scale, alternating, every step |
+| `workspace_escape` | `tcp_box` | in-range joints whose flange sits outside the box |
+| `lever_sprint` | `tcp_speed` | fully extended base sweep at perfectly legal joint speed |
+| `force_grind` | `force_max` | drive the flange into the contact plane |
+| `gripper_crush` | `grip_rate` | slam the gripper shut every step |
+| `stale_replay` | `stale` | the observation stops advancing |
+| `watchdog_starve` | `dt_max` | stop calling for longer than the watchdog |
+| `slow_drift` | `path_budget` | endless legal oscillation; no instantaneous bound can see it |
+
+The interesting two are the ones that are **legal at every instant**.
+`lever_sprint` respects every joint-space limit exactly and still moves the
+flange at 2.58 times the declared Cartesian limit, because speed is
+`‖J(q)‖·‖q̇‖` and the lever arm does the work. `slow_drift` never approaches any
+limit at all and simply never stops, which only a cumulative budget can see.
 
 ---
 
@@ -113,239 +218,103 @@ from sentinel.kernel import SafetyKernel
 from sentinel.shield import Shield
 
 kernel = SafetyKernel(Envelope.ur5e_declared())
-robot = Shield(your_lerobot_follower, kernel)
+robot  = Shield(your_lerobot_follower, kernel)
 
 obs = robot.get_observation()
 robot.send_action({"joint_position": policy(obs)})   # filtered, always
 ```
 
----
+Run the red team yourself:
 
-## The design
-
-### The envelope is a declaration, and it says so
-
-Every limit carries a `provenance` field of `datasheet`, `declared`, or
-`measured`. **Nothing in this repository may write `measured`.** Loading an
-envelope whose provenance claims a measured value without a named human and a
-date raises. That rule is structural, not documentary: `MappingProxyType` and
-defensive array copies mean it cannot be defeated after construction either.
-
-The declared envelope sits well inside the machine. Joint range is restricted to
-plus or minus 180 degrees against a datasheet 360, joint speed to 1.0 rad/s
-against 3.14, flange speed to 0.25 m/s against approximately 1.0. Every envelope
-is content-hashed, and that hash is written into every journal line, so a result
-can never be attributed to the wrong declaration.
-
-### Ten guards, in a fixed order
-
-Latch, validate, staleness, timestep, tracking, contact, cumulative budgets,
-kinematic shaping, Cartesian, gripper. The order is load bearing. Validation
-precedes any arithmetic on the numbers. Contact and budgets precede shaping,
-because both are reasons to stop outright rather than to shorten a step.
-
-`filter` performs no I/O and takes its clock by injection, which is what makes
-the whole thing deterministically testable.
-
-### Two things worth reading the code for
-
-**The braking bound.** Clamping position and velocity independently is unsound
-under an acceleration limit: you clamp the target, the joint is still moving, and
-it decelerates through the wall because deceleration is finite. So velocity is
-additionally capped by a discrete-exact stopping bound, and the same bound is
-applied one derivative up, capping acceleration against remaining velocity
-headroom for exactly the same reason. Measured on the emitted command sequence,
-worst case over both directions and six seeded start states:
-
-| quantity | measured | declared limit |
-|---|---|---|
-| max abs velocity | 1.000000 | 1.0 rad/s |
-| max abs acceleration | 5.000000 | 5.0 rad/s^2 |
-| max abs jerk | 100.0000 | 100.0 rad/s^3 |
-
-Each exactly at its limit, position held, arrival velocity 0.000000000, reaching
-the joint limit from rest in 101 control steps.
-
-**The kernel keeps its own clock.** It never compares the driver's timestamp
-against its own, and never trusts a caller-supplied timestep. On Windows,
-`time.monotonic()` and `time.perf_counter()` were measured 5.558460 seconds
-apart on the development machine, and the UR driver stamps with `perf_counter`.
-A guard comparing them latches a permanent stop against a perfectly healthy arm.
-So staleness compares the driver's successive stamps to each other, which is
-epoch independent, and the kernel's default clock is `perf_counter` because
-`monotonic` on Windows is `GetTickCount64()` at 15.625 ms resolution, roughly
-half a control period at 30 Hz, and the shaping chain divides by `dt` three
-times.
+```powershell
+.\tasks.ps1 quick      # 5 episodes x 300 steps, about 16 s
+.\tasks.ps1 redteam    # the full declared run, hours
+```
 
 ---
 
-## Results
+## The result
 
-**The full pre-registered run is complete.** 200 episodes of 2000 control
-steps for each of 15 attacks, 6,000,000 kernel calls, 10312.4 s wall clock,
-against envelope `ur5e-declared-v1`, SHA-256 `0d45a619219f` (truncated; the
-full digest is in every row of `results/redteam.csv`). The budget was fixed
-in the design specification before the first trial and was not adjusted
-afterward. The full pre-registration is [`PROTOCOL.md`](PROTOCOL.md).
+The full pre-registered run: **200 episodes of 2000 control steps for each of 15
+attacks, 6,000,000 kernel calls, 10312.4 s wall clock**, against envelope
+`ur5e-declared-v1`. The budget was fixed in the design specification before the
+first trial and was not adjusted afterwards. See [`PROTOCOL.md`](PROTOCOL.md).
 
-| attack | guard expected | escapes / episodes | guard fired |
-|---|---|---|---|
-| `dt_spoof` | `qd_max` | 0 / 200 | yes |
-| `force_grind` | `force_max` | 0 / 200 | yes |
-| `gripper_crush` | `grip_rate` | 0 / 200 | yes |
-| `index_permute` | `qd_max` | 0 / 200 | yes |
-| `jerk_chatter` | `qddd_max` | 0 / 200 | yes |
-| `lever_sprint` | `tcp_speed` | 0 / 200 | yes |
-| `nan_inject` | `nan` | 0 / 200 | yes |
-| `sign_flip` | `qd_max` | 0 / 200 | yes |
-| `slam_to_limit` | `q_limit` | 0 / 200 | yes |
-| `slow_drift` | `path_budget` | 0 / 200 | yes |
-| `stale_replay` | `stale` | 0 / 200 | yes |
-| `unit_confusion` | `q_limit` | 0 / 200 | yes |
-| `velocity_ramp` | `qd_max` | 0 / 200 | yes |
-| `watchdog_starve` | `dt_max` | 0 / 200 | yes |
-| `workspace_escape` | `tcp_box` | 0 / 200 | yes |
+| | |
+|---|---|
+| **escapes** | **0 of 200, every one of the 15 attacks** |
+| worst joint excursion | 0.0000 |
+| worst TCP excursion | 0.0000 |
+| declared guard fired | **15 of 15** |
+| journal hash chain | verifies |
 
-Every attack: 0 of 200 escapes. Worst joint excursion 0.0000, worst TCP
-excursion 0.0000, across all fifteen. All fifteen fired the guard they were
-written to trip. The journal's hash chain (`results/redteam.jsonl`) verifies
-with no break.
-
-**Those 200 episodes are 200 distinct trials.** The first version of this run
-was not: 12 of the 15 attacks produced bit-identical episodes across all 200
-repetitions, because the plant's seed was stored and never read, the clock is
-deterministic, and every episode began from the same fixed configuration. A
-confidence sequence over identical repeats carries the evidential content of
-n = 1, so the interval below would have claimed far more than the data
-supported. The plant now applies 2 milliradians of per-episode start jitter and
-0.2 milliradians of sensor noise, drawn from the seeded generator, with the
-jittered start re-verified against the envelope before step 0. All fifteen
-attacks now produce distinct trajectories and the same seed still reproduces
-exactly. This is the corrected run.
-
-`slow_drift` runs against a declared per-episode override,
-`path_budget_m = 8.0`, not the production envelope's 25.0 m: at
-`tcp_speed_max = 0.25` m/s, one 2000-step episode permits at most 16.667 m of
-travel, so the production budget cannot be reached inside a single episode by
-any attack. The override is not silent; it is in the source CSV's
-`envelope_override` column and recorded in `PROTOCOL.md` section 10.
-`LIMITATIONS.md` states plainly what this does and does not demonstrate about
-the guard at its real, declared value.
-
-### Invariant (A): the kernel's own command
-
-(A) is the property this programme actually claims: every command the kernel
-emitted, on every one of 6,000,000 calls in this run, satisfied the declared
-envelope. Zero escapes on the commanded-joint check across all fifteen
-attacks is a measurement of (A). It holds unconditionally here because the
-red-team's episodes all start from a verified, stoppable, in-envelope state;
-`LIMITATIONS.md` describes the narrower, non-stoppable states where (A)
-cannot be promised, and none of those states occurred in this run.
-
-### Invariant (B): the simulated plant, labelled as such
-
-(B) is a property of the *simulated servo*, not a claim about any real arm,
-and its margin, 0.02 rad per joint and 5 mm at the TCP, is an artefact of
-that simulation. The same run also found zero plant-side excursions against
-that margin, across all 3000 episodes. That is consistent with (B) holding
-for the specific start states the fifteen named attacks generate. **It is
-not evidence that (B) holds in general.** `tests/test_properties.py` finds
-two counterexamples to (B) under `hypothesis`, including a joint-stoppable,
-envelope-legal start that still carries the simulated plant 16 mm past the
-Cartesian margin, with the kernel commanding nothing unsafe throughout. That
-test is left failing on purpose, `xfail(strict=True)`, rather than fixed or
-hidden. See `LIMITATIONS.md` for both counterexamples in full. Do not read
-this run's zero as a broader claim about (B) than it supports.
-
-### Confidence sequences
-
-Computed post-hoc with `cairo_protocol.stats.anytime_cs` at alpha 0.05 from
-the recorded outcomes, after the run, because `cairo_protocol` lives in
-another repository and was not on this repository's own path while the
-runner itself ran:
+Anytime-valid 95% confidence sequences, computed post-hoc from the recorded
+outcomes:
 
 ```
-per attack,  0/200    anytime-valid 95% CS   [0.000001, 0.040501]
-pooled,      0/3000   anytime-valid 95% CS   [0.000001, 0.003501]
-Wilson fixed-n 95%,   0/3000                 [0.000000, 0.001279]
+per attack,  0/200    [0.000001, 0.040501]     escape rate below 4.05%
+pooled,      0/3000   [0.000001, 0.003501]     escape rate below 0.35%
 ```
 
-So the escape rate is below 4.05 percent per attack and below 0.35 percent
-pooled, valid at every stopping time rather than only at n = 200.
-**`results/redteam.csv`'s own `cs_lo` and `cs_hi` columns are raw escape
-rates, not these confidence sequences.** The runner printed a loud warning
-rather than silently substituting a different interval under the same column
-name once it found `cairo_protocol` unavailable on its path; that is
-documented, intended behaviour, recorded in `PROTOCOL.md` section 2. The
-numbers above are the actual anytime-valid intervals; the CSV's own
-`cs_lo`/`cs_hi` are not, in every row.
+Valid at every stopping time, not only at n=200.
 
-Reproduce the full run with:
+**Those 200 episodes are 200 distinct trials, and the first version of this run
+was not.** 12 of the 15 attacks produced bit-identical episodes across all 200
+repetitions, because the plant's seed was stored and never read. A confidence
+sequence over identical repeats carries the evidential content of n=1, so the
+interval above would have claimed far more than the data supported. The plant now
+applies 2 mrad of per-episode start jitter and 0.2 mrad of sensor noise from the
+seeded generator, with the jittered start re-verified against the envelope before
+step 0. The discarded run reported the *same* headline and is recorded as a
+deviation in `PROTOCOL.md` rather than quietly overwritten.
 
-```powershell
-.\tasks.ps1 redteam
-```
-
-or the quick five-episode smoke version:
-
-```powershell
-.\tasks.ps1 quick
-```
-
-CI does not invoke `tasks.ps1`. It runs `python -m pytest -q` and a clean-import
-check on Windows and Linux, and the suite itself contains a three-episode
-red-team smoke run (`test_no_attack_escapes_the_envelope`), so every push does
-exercise the runner, just not through that script.
+A note on the CSV: its own `cs_lo`/`cs_hi` columns are **raw rates, not
+confidence sequences**. The runner could not import `cairo_protocol`, which lives
+in another repository and is deliberately not vendored, and it printed a loud
+warning rather than substituting a differently-derived interval under the same
+column name.
 
 ---
 
 ## What is verified, and what is not
 
-Being precise about this is the point of the project.
+Being precise about this is the point of the project. The full list, with
+measured numbers, is in **[`LIMITATIONS.md`](LIMITATIONS.md)**. Read it before
+citing the result above.
 
-**Verified.** The kernel's guards, individually and composed, across 134 tests
+**Verified.** The kernel's guards, individually and composed, across 161 passing
+tests plus one deliberate failure,
 including property-based tests under `hypothesis` that drive the fully assembled
 kernel with adversarial input. Forward kinematics against two exact geometric
 invariants, independently reproduced three times. The hash chain against
-mid-file tampering, mid-file deletion, and re-attribution. The full
-pre-registered red-team run, reported above.
+tampering, deletion, re-attribution and truncation. The full pre-registered run.
 
-**Not verified.**
+**Not verified, and the four that matter most:**
 
-- **Five of the ten guards were never exercised by the red-team run.**
-  `contact_budget`, `torque_max`, `grip_range`, `tracking` and `latched` appear
-  in none of the fifteen result rows. The runner rearms after every stop, which
-  zeroes the cumulative budgets, so `contact_budget` in particular cannot
-  accumulate across an episode. A run that exercises half the guards should say
-  so, and this one does.
-- **No hardware, ever.** Every number here comes from a simulated plant. Passing
-  in simulation is necessary and nowhere near sufficient.
+- **Invariant (B) is refuted.** The simulated plant does *not* always stay within
+  the declared margin. A joint-stoppable velocity can carry it 16 mm past the
+  Cartesian margin with the kernel commanding nothing unsafe, because
+  **joint-space stoppability does not imply Cartesian stoppability**. The test is
+  left failing on purpose, `xfail(strict=True)`, so it cannot be silently
+  resolved.
+- **Five of the ten guards were never exercised by the run.**
+  `contact_budget`, `torque_max`, `grip_range`, `tracking` and `latched` appear in
+  none of the fifteen result rows. The runner rearms after every stop, which
+  zeroes the cumulative budgets. Zero escapes across 15 attacks sounds like it
+  tests the kernel; it tests half of it.
+- **No hardware, ever**, and every limit is declared rather than measured.
 - **The Shield has never been composed with the driver it wraps.** That driver
-  lives in a separate repository this programme does not touch. What is verified
-  is that the Shield honours the LeRobot dict contract, not that the real driver
-  does.
-- **Every declared limit is declared.** Conservative guesses are still guesses.
-- **No self-collision, no dynamics.** The kernel prevents envelope escape, not
-  the arm striking itself or a fixture, and acceleration limits are kinematic
-  declarations rather than actuator-derived.
-- **The kernel is in-process.** A crash of the calling process takes it with it.
-  An out-of-process supervisor is the right answer and is not built.
+  lives in a separate repository. What is verified is that the Shield honours the
+  LeRobot dict contract, not that the real driver does. *This is what M-03
+  KEYSTONE exists to close.*
 
-Invariant (A) carries two stated narrowings. It holds only from a *stoppable*
-start, because a joint closer to its limit than its own velocity can brake
-within is committed to an overshoot before the kernel is ever called. And its
-derivative guarantee, though not its position guarantee, degrades on steps where
-the final position clip engages under adversarial input.
-
-Invariant (B) is **refuted**, and its test is left failing on purpose. Joint
-space stoppability does not imply Cartesian stoppability.
-
-[`LIMITATIONS.md`](LIMITATIONS.md) carries the full list with the measured
-numbers. Read it before citing the result above.
+Invariant (A) also carries two stated narrowings: it holds only from a
+**stoppable** start, and its derivative guarantee, though not its position
+guarantee, degrades on steps where the final position clip engages.
 
 ---
 
-## Layout
+## Repository layout
 
 ```
 sentinel/
@@ -355,48 +324,71 @@ sentinel/
   kernel.py       SafetyKernel: all ten guards, pure and deterministic
   sim.py          second-order servo plant with saturated acceleration
   attacks.py      fifteen adversarial action generators
+  redteam.py      the runner, escape rates, journal, CSV
   shield.py       drop-in wrapper over any LeRobot-style follower
   journal.py      append-only hash-chained verdict log
-tests/            134 tests, including property-based tests
-docs/superpowers/ design specification and implementation plan
+tests/            161 passing, 1 deliberate xfail, including property tests
+results/          the committed canonical run
 docs/decisions/   defect records: what was claimed, measured, and changed
 ```
 
-1627 lines of package code against 2227 lines of tests.
+1873 lines of package code against 2473 lines of tests.
 
 ### `docs/decisions/` is worth a look
 
 Source comments cite documents by name, for example `task-10-fix-2.md,
-finding 2`. Those are in `docs/decisions/`, and they are the record of eighteen
-defects found during construction: what was claimed, what the measurement
+finding 2`. Those are in [`docs/decisions/`](docs/decisions/), and they record
+**more than twenty defects** found during construction: what was claimed, what the measurement
 showed, and what changed.
 
 They are published because the measurements are the evidence behind decisions
 that are otherwise invisible. `brake_headroom = 0.8` looks arbitrary until you
-see the sweep it came from. Almost none of those defects were found by reading
-code; they were found by running a measurement, or by a reviewer executing a
-claimed reproduction rather than trusting it.
+see the sweep it came from.
 
 ---
 
-## Development
+## How this was built
 
-This repository was built with a specification committed before the first line
-of code, an implementation plan argued from it, and a task-by-task review gate.
-The specification was amended once, before any trial ran, and that commit is
-recorded rather than quietly folded in.
+A specification committed before the first line of code, an implementation plan
+argued from it, and a task-by-task review gate. More than twenty defects were found.
+**Almost none were found by reading code.**
 
-Two habits earned their cost repeatedly and are worth keeping:
+Three habits did the work, and they are in [`CONTRIBUTING.md`](CONTRIBUTING.md):
 
 **Measure the claim before building on it.** Numeric assertions about control
-behaviour are unreliable until run, regardless of who wrote them or how
-carefully. Several claims in the original plan were refuted by measurement,
-including the core shaping algorithm, which failed its own test.
+behaviour are unreliable until run, regardless of who wrote them. The core
+shaping algorithm failed its own test. A braking assertion turned out
+unsatisfiable by *any* controller. A pre-registered budget turned out
+unreachable in principle: at the declared speed limit an episode permits 16.667 m
+of travel against a 25.0 m budget, an inconsistency between three separately
+sensible values that only arithmetic across three documents reveals.
 
-**Prove a test can fail.** A passing test tells you very little; a test you have
-watched fail for the right reason tells you a great deal. Three tests in this
-repository were found that could not distinguish the property they named, and
-one had been cited as evidence a bug was fixed when it had not been.
+**Be careful what you measured.** Three separate defects came from one cause: a
+probe written before a guard existed silently encodes that guard's absence as an
+assumption. A path-budget measurement taken without the Cartesian guard said the
+budget tripped at step 67; with the guard present the arm never moved and
+accumulated exactly 0.0 m. The measurement was correct about what it measured and
+wrong about the system that shipped.
+
+**Prove a test can fail.** Four tests here could not discriminate the property
+they named, and one had been cited as evidence a bug was fixed when it had not
+been. A passing test is weak evidence; a test you have watched fail for the right
+reason is strong evidence.
+
+The single most expensive mistake was a triage error, not a coding one. *"The
+plant's seed is stored and never read"* sat on a deferred-minor list marked
+cosmetic. It was the load-bearing half of the run's statistical validity.
+
+---
+
+## What comes next
+
+**M-03 KEYSTONE** attaches this kernel to a real LeRobot UR5e driver over RTDE,
+closing the largest thing this programme could not verify about itself. Its
+central design decision is a subtraction: the vendor skeleton's six safety
+defects are not fixed there, they are *removed*, because safety is this kernel's
+job and a driver carrying its own half-correct clamps is worse than one carrying
+none.
 
 ---
 
@@ -404,8 +396,8 @@ one had been cited as evidence a bug was fixed when it had not been.
 
 MIT. See [LICENSE](LICENSE).
 
-Note the warranty disclaimer is not boilerplate here. This is safety-adjacent
-code that has never been validated against hardware. If you deploy it, the
+The warranty disclaimer is not boilerplate here. This is safety-adjacent code
+that has never been validated against hardware. If you deploy it, the
 consequences are yours.
 
 ## Disclosure
