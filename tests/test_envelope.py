@@ -48,6 +48,26 @@ def test_measured_provenance_is_accepted_with_a_named_human():
     assert Envelope.from_dict(d).measured_by == "Tarek"
 
 
+def test_measured_provenance_rejects_a_whitespace_only_name():
+    # Reclassified list / final-fix-1.md (envelope.py:132): a whitespace
+    # string is truthy in Python, so this used to pass as a named human.
+    d = Envelope.ur5e_declared().to_dict()
+    d["provenance"]["force_max"] = "measured"
+    d["measured_by"] = "   "
+    d["measured_on"] = "2026-09-05"
+    with pytest.raises(ValueError, match="measured"):
+        Envelope.from_dict(d)
+
+
+def test_measured_provenance_rejects_a_whitespace_only_date():
+    d = Envelope.ur5e_declared().to_dict()
+    d["provenance"]["force_max"] = "measured"
+    d["measured_by"] = "Tarek"
+    d["measured_on"] = "   "
+    with pytest.raises(ValueError, match="measured"):
+        Envelope.from_dict(d)
+
+
 def test_envelope_rejects_inverted_joint_limits():
     with pytest.raises(ValueError):
         Envelope.ur5e_declared().replace(q_min=np.full(6, 10.0))
@@ -108,6 +128,19 @@ def test_mutating_input_arrays_does_not_change_stored_arrays():
     assert not np.shares_memory(env.q_min, arr)
 
 
+def test_stored_arrays_cannot_be_mutated_after_construction():
+    # I5 / final-fix-1.md: `env.qd_max[0] = 99.0` used to succeed against the
+    # defensive copy made at construction, silently changing the declaration
+    # and the hash it reports. A copy that is still writeable only pushes
+    # the defeat one step later.
+    env = Envelope.ur5e_declared()
+    before = env.sha256()
+    with pytest.raises(ValueError):
+        env.qd_max[0] = 99.0
+    assert env.qd_max[0] == 1.0
+    assert env.sha256() == before
+
+
 def test_box_input_arrays_do_not_alias():
     lo_arr = np.array([0.0, 0.0, 0.0])
     hi_arr = np.array([1.0, 1.0, 1.0])
@@ -118,6 +151,14 @@ def test_box_input_arrays_do_not_alias():
     assert b.hi[0] != 999.0
     assert not np.shares_memory(b.lo, lo_arr)
     assert not np.shares_memory(b.hi, hi_arr)
+
+
+def test_box_stored_arrays_cannot_be_mutated_after_construction():
+    b = Box(lo=[-1.0, -1.0, 0.0], hi=[1.0, 1.0, 2.0])
+    with pytest.raises(ValueError):
+        b.lo[0] = 99.0
+    with pytest.raises(ValueError):
+        b.hi[0] = -99.0
 
 
 def test_json_roundtrip_includes_brake_headroom():

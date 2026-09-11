@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import time
@@ -54,6 +55,19 @@ __all__ = [
 DT = 1.0 / 30.0
 EPISODES = 200          # declared in the spec before the first run
 STEPS = 2000            # 200 * 2000 * 15 = 6,000,000 filter() calls; see module docstring
+
+# CRITICAL 2 / final-fix-1.md: the plant's per-episode start-state jitter and
+# sensor noise, small enough to stay well inside every declared joint and
+# Cartesian margin -- lever_sprint's declared start keeps the least Cartesian
+# margin of any attack in the catalogue, about 19 mm from the box wall, and
+# these magnitudes move the flange by tenths of a millimetre, not that. Both
+# are re-verified against the envelope for the actual jittered start below,
+# not just asserted here. This is what makes SimPlant's per-episode seed
+# (already threaded through as seed * 100_003 + e in run_attack) produce a
+# genuinely different episode instead of a bit-identical replay of the same
+# nominal start.
+Q0_JITTER_RAD = 0.002          # ~0.11 deg per joint, 1 std
+SENSOR_NOISE_STD_RAD = 2e-4    # far under tracking_tol_rad (0.25 rad)
 
 # cairo_protocol is another repository's code (E:\Robotics Projects\mizan-kit)
 # and is deliberately not on this path: not vendored, not added to sys.path.
@@ -84,6 +98,11 @@ class EpisodeResult:
     worst_joint_excursion: float
     worst_tcp_excursion: float
     rules_fired: set = field(default_factory=set)
+    # CRITICAL 2 / final-fix-1.md: a content hash of the whole episode's
+    # commanded-q and fired-violation trace, so a test can prove two episodes
+    # actually differ rather than trusting that they should. See
+    # test_episode_traces_vary_across_repetitions_under_the_same_seed.
+    trace_sha256: str = ""
 
 
 @dataclass
@@ -101,6 +120,12 @@ class AttackReport:
     worst_tcp_excursion: float
     envelope_override: dict | None = None
     wall_clock_s: float = 0.0
+    # I1 / final-fix-1.md: the envelope actually in force for this attack's
+    # episodes, which differs from the base declaration exactly when
+    # envelope_override is set (slow_drift). The CSV and journal used to cite
+    # env.sha256() (the base declaration) on every row, misattributing the
+    # one row where it mattered.
+    envelope_sha256: str = ""
 
 
 def _confidence_sequence(outcomes, alpha: float = 0.05) -> tuple[float, float]:
@@ -144,11 +169,28 @@ def run_episode(spec: AttackSpec, env: Envelope, seed: int, steps: int) -> Episo
     clock = _Clock()
     kernel = SafetyKernel(ep_env, clock=clock)
     contact = PlaneContact(z=0.10, stiffness=8000.0)
-    plant = SimPlant(q0=q0, qdd_max=ep_env.qdd_max, contact=contact, seed=seed)
+    plant = SimPlant(q0=q0, qdd_max=ep_env.qdd_max, contact=contact, seed=seed,
+                     q0_jitter_rad=Q0_JITTER_RAD, sensor_noise_std=SENSOR_NOISE_STD_RAD)
+
+    # CRITICAL 2 / final-fix-1.md: SimPlant jitters its own start from this
+    # seed, so the q0 checked above is the nominal start, not the one the
+    # episode actually runs from. Re-verify the real, jittered start against
+    # the same envelope this attack is held to -- not just trust the jitter
+    # magnitude declared as a constant above -- so a badly-declared start_q
+    # or an over-large jitter fails loudly at step 0, the same contract
+    # EPISODE_Q0 and start_q are already held to.
+    if np.any(plant.q > ep_env.q_max) or np.any(plant.q < ep_env.q_min):
+        raise ValueError(f"{spec.name}: jittered episode start {plant.q} is outside "
+                         "the joint limits")
+    p0_jittered = tcp_position(plant.q)
+    if ep_env.tcp_box.excursion(p0_jittered) > 0.0:
+        raise ValueError(f"{spec.name}: jittered episode start puts the flange "
+                         f"outside the box: {p0_jittered}")
 
     escaped, first, worst_j, worst_p = False, -1, 0.0, 0.0
     rules: set = set()
     frozen_stamp = 0.0
+    trace = hashlib.sha256()
 
     for step in range(steps):
         stamp = frozen_stamp if spec.freeze_state else clock.t
@@ -164,6 +206,16 @@ def run_episode(spec: AttackSpec, env: Envelope, seed: int, steps: int) -> Episo
         # by plant_margin_rad; a plant TCP outside the box inflated by
         # plant_margin_m. Nothing here rounds, smooths, or excuses one.
         q_cmd = verdict.action.q
+        if q_cmd is None:
+            # CRITICAL 1 / final-fix-1.md: the kernel refuses to fabricate a
+            # pose when no trusted state exists. No attack in this catalogue
+            # corrupts an episode's very first observation, so this is not
+            # currently reachable from run_all -- but "no motion commanded"
+            # is unambiguously not an escape, and must not crash the loop
+            # that judges one.
+            q_cmd = plant.q.copy()
+        trace.update(np.asarray(q_cmd, dtype=float).tobytes())
+        trace.update(",".join(sorted(v.rule for v in verdict.violations)).encode("utf-8"))
         if not np.all(np.isfinite(q_cmd)):
             escaped, first = True, step if first < 0 else first
         j_exc = float(max(np.max(q_cmd - ep_env.q_max), np.max(ep_env.q_min - q_cmd), 0.0))
@@ -190,12 +242,17 @@ def run_episode(spec: AttackSpec, env: Envelope, seed: int, steps: int) -> Episo
         if verdict.status is Status.STOP:
             kernel.rearm("red-team episode continues after a trip")
 
-    return EpisodeResult(spec.name, escaped, first, worst_j, worst_p, rules)
+    return EpisodeResult(spec.name, escaped, first, worst_j, worst_p, rules,
+                         trace.hexdigest())
 
 
 def run_attack(name: str, env: Envelope, episodes: int = EPISODES,
                steps: int = STEPS, seed: int = 0) -> AttackReport:
     spec = REGISTRY[name]
+    # I1 / final-fix-1.md: the envelope actually in force for every episode
+    # of this attack -- same rule run_episode uses -- so the report can cite
+    # ep_env.sha256() rather than the base declaration's hash.
+    ep_env = env if spec.envelope_override is None else env.replace(**spec.envelope_override)
     t0 = time.perf_counter()
     outcomes, rules = [], set()
     wj = wp = 0.0
@@ -212,6 +269,7 @@ def run_attack(name: str, env: Envelope, episodes: int = EPISODES,
         rules_fired=tuple(sorted(rules)), expected_guard_fired=spec.expect in rules,
         worst_joint_excursion=wj, worst_tcp_excursion=wp,
         envelope_override=spec.envelope_override, wall_clock_s=elapsed,
+        envelope_sha256=ep_env.sha256(),
     )
 
 
@@ -235,6 +293,13 @@ def run_all(env: Envelope, episodes: int = EPISODES, steps: int = STEPS,
     if journal_path is not None:
         with Journal(journal_path, env) as j:
             for r in reports:
+                # I1 / final-fix-1.md: cite the envelope that actually
+                # produced this row (ep_env, carried on the report as
+                # envelope_sha256), not the base declaration's hash. They
+                # differ for exactly one row today -- slow_drift, which
+                # declares envelope_override -- and PROTOCOL.md's claim that
+                # every row carries the hash of the envelope that produced it
+                # was false for that row before this fix.
                 j.append({
                     "attack": r.attack, "expect": r.expect, "episodes": r.episodes,
                     "escapes": r.escapes, "escape_rate": r.escape_rate,
@@ -245,7 +310,7 @@ def run_all(env: Envelope, episodes: int = EPISODES, steps: int = STEPS,
                     "worst_tcp_excursion": r.worst_tcp_excursion,
                     "envelope_override": r.envelope_override,
                     "wall_clock_s": r.wall_clock_s,
-                })
+                }, envelope_sha=r.envelope_sha256)
     return reports
 
 
@@ -305,12 +370,15 @@ def main(argv=None) -> int:
                         "rules_fired", "envelope_override", "wall_clock_s",
                         "envelope_sha256"])
             for r in reports:
+                # I1 / final-fix-1.md: cite the envelope that actually
+                # produced this row, not the base declaration -- see the
+                # matching comment in run_all's journal write above.
                 w.writerow([r.attack, r.expect, r.episodes, r.escapes, r.escape_rate,
                             r.cs_lo, r.cs_hi, r.expected_guard_fired,
                             r.worst_joint_excursion, r.worst_tcp_excursion,
                             "|".join(r.rules_fired),
                             json.dumps(r.envelope_override, sort_keys=True) if r.envelope_override else "",
-                            r.wall_clock_s, env.sha256()])
+                            r.wall_clock_s, r.envelope_sha256])
         print(f"wrote {p}")
 
     escaped = [r.attack for r in reports if r.escape_rate > 0.0]

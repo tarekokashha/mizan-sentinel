@@ -111,6 +111,26 @@ def test_the_shield_stops_a_non_finite_action_before_the_robot_sees_it():
     assert s.last_verdict.status is Status.STOP
 
 
+def test_the_shield_forwards_nothing_when_the_kernel_refuses_to_command_a_pose():
+    # CRITICAL 1 / final-fix-1.md: a non-finite observation on the very
+    # first call used to make the kernel fabricate np.zeros(6) as a hold
+    # position -- 0.167200 m outside the declared tcp_box -- and the old
+    # Shield.send_action forwarded verdict.action.q unconditionally,
+    # including on STOP. Prove nothing reaches the fake robot at all: not a
+    # fabricated pose, not the raw request, nothing.
+    r = FakeRobot()
+    s = Shield(r, SafetyKernel(r.env, clock=Clock(r)))
+    obs = r.get_observation()
+    obs["joint_position"] = np.full(6, np.nan)
+    r.get_observation = lambda: obs
+    s.get_observation()                     # the shield's very first observation
+    out = s.send_action({"joint_position": np.zeros(6)})
+    assert s.last_verdict.status is Status.STOP
+    assert s.last_verdict.action.q is None
+    assert r.sent == [], "nothing must reach the robot when there is no trusted pose to hold"
+    assert out == {}
+
+
 def test_the_shield_never_lets_a_slam_reach_the_robot_out_of_range():
     r = FakeRobot()
     s = Shield(r, SafetyKernel(r.env, clock=Clock(r)))

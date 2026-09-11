@@ -192,3 +192,58 @@ def test_the_first_call_establishes_a_reference_without_commanding_motion():
     q0 = np.full(6, 0.3)
     v = k.filter(state(q=q0, t=c.t), Action(q=np.full(6, 2.0)))
     assert np.allclose(v.action.q, q0)
+
+
+def test_persistent_tracking_divergence_escalates_to_stop():
+    # I3 / final-fix-1.md: guard 2 used to reset the same counter guard 4
+    # increments, on every call where the driver stamp advances -- which is
+    # every healthy call -- so a persistent tracking gap under a perfectly
+    # healthy, advancing clock could never reach stale_escalate_n and the
+    # STOP this guard names was dead code. Tracking now has its own counter.
+    #
+    # A single tracking violation resynchronises _q_cmd to the measurement
+    # (see test_divergence_between_command_and_measurement_holds_and_resyncs),
+    # so a *persistent* gap needs the measurement to keep moving away from
+    # wherever the kernel just resynced to, not a single fixed target.
+    k, c, env = kernel()
+    k.filter(state(t=c.t), Action(q=np.zeros(6)))
+    step = env.tracking_tol_rad * 3
+    seen = []
+    for i in range(env.stale_escalate_n):
+        c.tick(1 / 30)                              # a perfectly healthy clock
+        q_i = np.full(6, step * (i + 1))
+        seen.append(k.filter(state(q=q_i, t=c.t), Action(q=q_i)).status)
+    assert seen[:-1] == [Status.HOLD] * (env.stale_escalate_n - 1)
+    assert seen[-1] is Status.STOP
+
+
+def test_a_non_finite_state_on_the_first_call_commands_no_motion():
+    # CRITICAL 1 / final-fix-1.md: on the very first call there is no prior
+    # _q_cmd to fall back to. The old code fabricated np.zeros(6) instead --
+    # tcp_position(zeros) sits 0.167200 m outside the declared tcp_box, so a
+    # NaN in the driver's first observation used to make this safety kernel
+    # command an out-of-workspace pose. It must refuse and command nothing.
+    k, c, _ = kernel()
+    bad = np.zeros(6)
+    bad[2] = np.nan
+    v = k.filter(state(q=bad, t=c.t), Action(q=np.zeros(6)))
+    assert v.status is Status.STOP
+    assert v.action.q is None
+    assert k.tripped
+
+    # Still latched, still refusing motion, on every subsequent call -- not
+    # just the first -- and it must not crash trying to .copy() a q_cmd that
+    # was never established.
+    c.tick(1 / 30)
+    v2 = k.filter(state(t=c.t), Action(q=np.full(6, 0.1)))
+    assert v2.status is Status.STOP
+    assert v2.action.q is None
+
+    # Rearm gives the kernel a genuine chance to establish a reference from
+    # the next valid observation, exactly like a true first call.
+    k.rearm("operator cleared the cell")
+    q0 = np.full(6, 0.2)
+    c.tick(1 / 30)
+    v3 = k.filter(state(q=q0, t=c.t), Action(q=np.full(6, 2.0)))
+    assert v3.status is Status.HOLD
+    assert np.allclose(v3.action.q, q0)

@@ -41,6 +41,13 @@ class SafetyKernel:
         self._tcp_prev: np.ndarray | None = None
         self._position_clip_engaged = False
         self._stale_n = 0
+        # Separate from _stale_n (I3 / final-fix-1.md): guard 2 resets
+        # _stale_n on every call where the driver stamp advances, which is
+        # every healthy call, so sharing one counter meant a persistent
+        # tracking gap under a perfectly healthy clock could never reach
+        # stale_escalate_n and the STOP at guard 4 was unreachable. Tracking
+        # gets its own counter, reset whenever the gap closes.
+        self._tracking_n = 0
         self._tripped = False
         self._trip_reason = ""
         self.path_m = 0.0
@@ -63,6 +70,7 @@ class SafetyKernel:
         self._tripped = False
         self._trip_reason = ""
         self._stale_n = 0
+        self._tracking_n = 0
         self.path_m = 0.0
         self.contact_s = 0.0
         self._qd_cmd = np.zeros(6)
@@ -72,10 +80,26 @@ class SafetyKernel:
         self._t_src_fresh_at = 0.0
 
     # ---- helpers ---------------------------------------------------------- #
+    def _clip_to_envelope(self, q) -> np.ndarray:
+        """Clamp a to-be-commanded q into [q_min, q_max].
+
+        final-fix-1.md: _shape() already clips its own output explicitly, but
+        _hold()/_stop() echo "wherever the arm actually is" straight back as
+        the commanded action, unclipped. That value is a sensor reading, not
+        a computed target, and a sensor reading can sit a hair past the
+        declared boundary -- from measurement noise, or from the plant's own
+        momentum on a step where the arm is already near a limit -- without
+        the arm itself having done anything the kernel did not command. The
+        kernel's own output must never itself be one of the things this
+        project counts as an escape, so every path that can emit a command
+        clips it, not only the one that computes a target.
+        """
+        return np.clip(np.asarray(q, dtype=float), self.env.q_min, self.env.q_max)
+
     def _hold(self, q_hold, violations, dt, extra=None) -> Verdict:
         self._qd_cmd = np.zeros(6)
         self._qdd_cmd = np.zeros(6)
-        self._q_cmd = np.asarray(q_hold, dtype=float).copy()
+        self._q_cmd = self._clip_to_envelope(q_hold)
         return Verdict(Status.HOLD, Action(q=self._q_cmd.copy(), gripper=self._grip_cmd),
                        tuple(violations), dt, extra or {})
 
@@ -84,7 +108,7 @@ class SafetyKernel:
         self._trip_reason = reason
         self._qd_cmd = np.zeros(6)
         self._qdd_cmd = np.zeros(6)
-        self._q_cmd = np.asarray(q_hold, dtype=float).copy()
+        self._q_cmd = self._clip_to_envelope(q_hold)
         return Verdict(Status.STOP, Action(q=self._q_cmd.copy(), gripper=self._grip_cmd),
                        tuple(violations), dt, {"reason": reason})
 
@@ -261,17 +285,42 @@ class SafetyKernel:
         self._t_prev = now
 
         q_now = np.asarray(state.q, dtype=float)
-        q_safe = q_now if np.all(np.isfinite(q_now)) else (
-            self._q_cmd if self._q_cmd is not None else np.zeros(6))
+        q_state_finite = bool(np.all(np.isfinite(q_now)))
 
-        # 0. already latched
+        # 0. already latched. _q_cmd can itself be None here (the case just
+        # below latches without ever setting a reference), so there may be no
+        # position to hold -- report that rather than crash on .copy().
         if self._tripped:
-            return Verdict(Status.STOP, Action(q=self._q_cmd.copy(), gripper=self._grip_cmd),
+            q_hold = None if self._q_cmd is None else self._q_cmd.copy()
+            return Verdict(Status.STOP, Action(q=q_hold, gripper=self._grip_cmd),
                            (Violation("latched", 1.0, 0.0),), dt_raw,
                            {"reason": self._trip_reason})
 
         # 1. validate
-        if not np.all(np.isfinite(q_now)) or not np.all(np.isfinite(state.qd)) \
+        #
+        # CRITICAL 1 / final-fix-1.md: with no prior command AND a non-finite
+        # observation, there is no trusted position to hold. The old fallback
+        # fabricated one -- np.zeros(6) -- and _stop() emitted it as the
+        # commanded action, which Shield forwarded unconditionally.
+        # tcp_position(zeros) sits 0.167200 m outside tcp_box: a NaN on the
+        # very first call from the driver became an unshaped command to a
+        # pose outside the declared workspace, in a safety kernel. Refuse
+        # instead: command no motion at all. This must be checked before the
+        # general non-finite-state guard below, which still has a real
+        # position (self._q_cmd, from an earlier valid call) to fall back to
+        # and so does not need to refuse.
+        if self._q_cmd is None and not q_state_finite:
+            self._tripped = True
+            self._trip_reason = "non-finite observation before any valid state"
+            return Verdict(Status.STOP, Action(q=None), (Violation("nan", float("nan"), 0.0),),
+                           dt_raw, {"reason": self._trip_reason})
+
+        # Beyond this point a fallback position is always available: either
+        # q_now is finite, or self._q_cmd is not None (the case above is the
+        # only one where both can fail at once).
+        q_safe = q_now if q_state_finite else self._q_cmd
+
+        if not q_state_finite or not np.all(np.isfinite(state.qd)) \
                 or not np.all(np.isfinite(state.wrench)):
             return self._stop(q_safe, [Violation("nan", float("nan"), 0.0)], dt_raw,
                               "non-finite state")
@@ -280,14 +329,17 @@ class SafetyKernel:
             return self._stop(q_now, [Violation("nan", float("nan"), 0.0)], dt_raw,
                               "non-finite action")
 
-        # first call establishes the reference and commands no motion
+        # first call establishes the reference and commands no motion.
+        # Clipped for the same reason _hold()/_stop() are (final-fix-1.md):
+        # q_now is a sensor reading, and a reading may sit a hair past the
+        # declared boundary without the kernel having commanded anything.
         if self._q_cmd is None:
-            self._q_cmd = q_now.copy()
+            self._q_cmd = self._clip_to_envelope(q_now)
             self._grip_cmd = float(state.gripper)
-            self._tcp_prev = tcp_position(q_now)
+            self._tcp_prev = tcp_position(self._q_cmd)
             self._t_src_fresh_at = now
             self._t_src_prev = float(state.t_mono)
-            return Verdict(Status.HOLD, Action(q=q_now.copy(), gripper=self._grip_cmd),
+            return Verdict(Status.HOLD, Action(q=self._q_cmd.copy(), gripper=self._grip_cmd),
                            (), 0.0, {"first_call": True})
 
         # 2. staleness: is the driver's observation actually advancing?
@@ -325,13 +377,19 @@ class SafetyKernel:
         dt = float(np.clip(dt_raw, env.min_dt_s, env.max_dt_s))
 
         # 4. tracking: is the arm actually where we last told it to be
+        #
+        # Uses its own counter (I3 / final-fix-1.md), not _stale_n: guard 2
+        # resets _stale_n whenever the driver stamp advances, which is every
+        # healthy call, so a persistent tracking gap under a healthy clock
+        # could never accumulate on a shared counter.
         gap = float(np.max(np.abs(self._q_cmd - q_now)))
         if gap > env.tracking_tol_rad:
-            self._stale_n += 1
+            self._tracking_n += 1
             v = [Violation("tracking", gap, env.tracking_tol_rad)]
-            if self._stale_n >= env.stale_escalate_n:
+            if self._tracking_n >= env.stale_escalate_n:
                 return self._stop(q_now, v, dt_raw, "arm is not tracking the command")
             return self._hold(q_now, v, dt_raw)
+        self._tracking_n = 0
 
         # 5. contact: excess force or torque stops outright, never shortens
         #

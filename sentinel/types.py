@@ -66,13 +66,22 @@ class RobotState:
 
 @dataclass(frozen=True, eq=False)
 class Action:
-    """One commanded joint target, plus an optional gripper position."""
+    """One commanded joint target, plus an optional gripper position.
 
-    q: np.ndarray
+    `q` is `None` only when the kernel has no trusted state to hold and
+    refuses to fabricate one -- see SafetyKernel.filter's guard for a
+    non-finite observation on the very first call. `None` means command no
+    motion at all; it is not a stand-in for "hold the last position", and a
+    caller forwarding an Action to a robot must check for it before sending
+    anything.
+    """
+
+    q: np.ndarray | None
     gripper: float | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "q", np.array(self.q, dtype=float).reshape(N_JOINTS))
+        if self.q is not None:
+            object.__setattr__(self, "q", np.array(self.q, dtype=float).reshape(N_JOINTS))
 
 
 @dataclass(frozen=True, eq=False)

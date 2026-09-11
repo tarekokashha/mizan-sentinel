@@ -71,14 +71,25 @@ class Shield:
             self.journal.append({
                 "seq": self._seq, "status": verdict.status.value,
                 "violations": [str(v) for v in verdict.violations],
-                "q_cmd": [float(x) for x in verdict.action.q], "dt": verdict.dt,
+                "q_cmd": None if verdict.action.q is None else [float(x) for x in verdict.action.q],
+                "dt": verdict.dt,
             })
         self._seq += 1
+        self._last_state = None          # force a fresh observation each cycle
+
+        # CRITICAL 1 / final-fix-1.md: a None joint command means the kernel
+        # refused to fabricate a pose (no trusted state existed to hold).
+        # Nothing reaches the robot in that case -- not zeros, not the raw
+        # request, nothing. self.robot.send_action is not called at all, and
+        # the return value deliberately does not echo the caller's request
+        # back as if it had been honoured: an empty dict is the honest answer
+        # to "what did the robot receive."
+        if verdict.action.q is None:
+            return {}
 
         out = dict(action)
         out["joint_position"] = verdict.action.q
         if verdict.action.gripper is not None:
             out["gripper_position"] = np.array([verdict.action.gripper])
         sent = self.robot.send_action(out)
-        self._last_state = None          # force a fresh observation each cycle
         return sent

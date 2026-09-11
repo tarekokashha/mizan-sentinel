@@ -110,10 +110,35 @@ def test_force_grind_trips_force_max_against_the_declared_plane():
         "than the measured step 180 -- investigate before trusting the fix")
 
 
-def test_the_escape_rate_carries_an_anytime_valid_interval():
+def test_the_escape_rate_carries_an_anytime_valid_interval(monkeypatch):
+    # I7 / final-fix-1.md: the original version of this test asserted
+    # cs_lo <= escape_rate <= cs_hi while _ANYTIME_CS is None in this
+    # environment (cairo_protocol lives in another repository and is
+    # deliberately not on this path). _confidence_sequence always returns
+    # (p, p) on that fallback path, so the inequality held by construction
+    # -- it could not fail no matter what the code around it did, the same
+    # thing test_confidence_sequence_degrades_loudly_when_cairo_protocol_is_unavailable
+    # already proves directly. Fake a non-degenerate anytime-valid interval
+    # so this test actually exercises the wiring that carries cs_lo/cs_hi
+    # from _confidence_sequence through to the report, and can fail if that
+    # wiring breaks -- e.g. if run_attack silently ignored _ANYTIME_CS and
+    # always used the raw-rate fallback, cs_lo and cs_hi below would both
+    # equal escape_rate exactly, not diverge from it by 0.1 in each
+    # direction. Deliberately not clamped to [0, 1]: this is a fake standing
+    # in for an unknown real interval shape, not a realistic one, and an
+    # unclamped interval is what makes the assertion exact rather than an
+    # inequality that could hold by coincidence near the boundary.
+    import sentinel.redteam as rt
+
+    def fake_cs(outcomes, alpha=0.05):
+        p = float(np.mean(outcomes)) if len(outcomes) else 0.0
+        return p - 0.1, p + 0.1
+
+    monkeypatch.setattr(rt, "_ANYTIME_CS", fake_cs)
     env = Envelope.ur5e_declared()
     r = run_attack("slam_to_limit", env, episodes=5, steps=200, seed=0)
-    assert 0.0 <= r.cs_lo <= r.escape_rate <= r.cs_hi <= 1.0
+    assert r.cs_lo == pytest.approx(r.escape_rate - 0.1)
+    assert r.cs_hi == pytest.approx(r.escape_rate + 0.1)
 
 
 def test_runs_are_reproducible_under_a_seed():
@@ -122,6 +147,43 @@ def test_runs_are_reproducible_under_a_seed():
     b = run_attack("jerk_chatter", env, episodes=3, steps=200, seed=42)
     assert a.escape_rate == b.escape_rate
     assert a.rules_fired == b.rules_fired
+
+
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_episode_traces_genuinely_vary_across_repetitions(name):
+    # CRITICAL 2 / final-fix-1.md: measured by the reviewer, 12 of 15 attacks
+    # produced bit-identical episodes across all 200 repetitions before this
+    # fix -- 11 attack builders never touched the rng they were handed,
+    # SimPlant.seed was stored and never read, and every episode started
+    # from the same fixed q0. A confidence sequence over 200 identical
+    # deterministic repeats carries the evidential content of n = 1. This is
+    # the test the suite silently lacked: trace-hash episodes 0, 1 and 7 (the
+    # same per-episode seed formula run_attack uses, seed * 100_003 + e) and
+    # assert they actually differ, for every attack in the catalogue, not
+    # just the three the reviewer found already varying.
+    env = Envelope.ur5e_declared()
+    spec = REGISTRY[name]
+    hashes = [run_episode(spec, env, seed=0 * 100_003 + e, steps=300).trace_sha256
+             for e in (0, 1, 7)]
+    assert len(set(hashes)) == 3, (
+        f"{name}: episodes 0, 1 and 7 are not all distinct ({hashes}) -- the "
+        "plant's start-state jitter and sensor noise (both driven by "
+        "SimPlant's per-episode seed) should make every attack in this "
+        "catalogue vary episode to episode; if one genuinely cannot, that is "
+        "a finding to report, not a reason to weaken this assertion")
+
+
+def test_repeating_the_same_episode_seed_reproduces_the_same_trace():
+    # The other half of CRITICAL 2's contract: genuine variation across
+    # different seeds must not come at the cost of reproducibility under the
+    # same seed -- test_runs_are_reproducible_under_a_seed already covers
+    # run_attack's aggregate escape_rate/rules_fired; this covers the
+    # underlying per-episode trace directly.
+    env = Envelope.ur5e_declared()
+    spec = REGISTRY["slow_drift"]
+    a = run_episode(spec, env, seed=12345, steps=300)
+    b = run_episode(spec, env, seed=12345, steps=300)
+    assert a.trace_sha256 == b.trace_sha256
 
 
 def test_a_deliberately_broken_kernel_is_caught(monkeypatch):

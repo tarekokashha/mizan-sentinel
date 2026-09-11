@@ -46,6 +46,11 @@ class Box:
         object.__setattr__(self, "hi", np.array(self.hi, dtype=float).reshape(3))
         if not np.all(self.hi > self.lo):
             raise ValueError("Box hi must exceed lo on every axis")
+        # I5 / final-fix-1.md: a defensive copy at construction stops
+        # aliasing but not `box.lo[0] = 99.0` against the copy itself, which
+        # silently changes the declaration after the fact.
+        self.lo.flags.writeable = False
+        self.hi.flags.writeable = False
 
     def contains(self, p) -> bool:
         p = np.asarray(p, dtype=float).reshape(3)
@@ -93,9 +98,13 @@ class Envelope:
 
     def __post_init__(self) -> None:
         for name in _ARRAY_FIELDS:
-            object.__setattr__(
-                self, name, np.array(getattr(self, name), dtype=float).reshape(N_JOINTS)
-            )
+            arr = np.array(getattr(self, name), dtype=float).reshape(N_JOINTS)
+            # I5 / final-fix-1.md: `env.qd_max[0] = 99.0` used to succeed
+            # against this defensive copy, silently changing the declaration
+            # and the hash it reports. README.md's claim that construction
+            # defends against this was true only at construction time.
+            arr.flags.writeable = False
+            object.__setattr__(self, name, arr)
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
         if not np.all(self.q_max > self.q_min):
             raise ValueError("q_max must exceed q_min on every joint")
@@ -129,7 +138,12 @@ class Envelope:
                    if f.name not in _META_FIELDS and f.name not in self.provenance]
         if missing:
             raise ValueError(f"these fields have no provenance: {missing}")
-        if "measured" in self.provenance.values() and not (self.measured_by and self.measured_on):
+        # Reclassified list / final-fix-1.md (envelope.py:132): a whitespace
+        # string is truthy in Python, so `measured_by="   "` used to pass
+        # this check as though it named a human. Strip before judging.
+        measured_by_named = bool(self.measured_by) and bool(self.measured_by.strip())
+        measured_on_named = bool(self.measured_on) and bool(str(self.measured_on).strip())
+        if "measured" in self.provenance.values() and not (measured_by_named and measured_on_named):
             raise ValueError(
                 "a provenance of 'measured' requires measured_by and measured_on; "
                 "only a human who ran the arm may write a measured number"
