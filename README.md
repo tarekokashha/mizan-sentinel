@@ -21,9 +21,16 @@ This repository builds that gate. It does not walk through it.
 > ## Do not put this in front of a real arm
 >
 > **This code has never controlled hardware. Not once.** Every number in this
-> repository comes from a simulated plant, every limit is declared rather than
-> measured, and the red-team suite that would give any of it weight has not been
-> run.
+> repository, including the zero-escape result below, comes from a simulated
+> plant, and every limit is declared rather than measured.
+>
+> The red-team result makes that warning more important, not less. Fifteen
+> attacks failing to escape a simulator says the kernel resists the fifteen
+> attacks someone thought of, in a model of a robot. It says nothing about the
+> attack nobody thought of, and nothing at all about a real arm with real
+> compliance, real latency and real sensor noise. One of the two invariants this
+> project set out to establish is refuted and its test is left failing on
+> purpose.
 >
 > It is also in-process: a crash of the calling process takes the safety layer
 > with it. Real machine safety needs a supervisor the application cannot kill, a
@@ -38,7 +45,8 @@ This repository builds that gate. It does not walk through it.
 
 ## Status
 
-**The kernel is complete and tested. The red-team results do not exist yet.**
+**The kernel is complete and tested, and the full pre-registered red-team run
+is complete: zero escapes across 3000 episodes.**
 
 | component | state |
 |---|---|
@@ -47,15 +55,20 @@ This repository builds that gate. It does not walk through it.
 | `journal` tamper-evident hash-chained log | complete, reviewed |
 | `kernel` all ten guards | complete, reviewed |
 | `sim` second-order servo plant | complete, reviewed |
-| `attacks` fifteen adversarial generators | complete, one fix outstanding |
+| `attacks` fifteen adversarial generators | complete |
 | `shield` drop-in wrapper | complete, reviewed |
-| property tests under `hypothesis` | complete |
-| **`redteam` escape-rate runner** | **not built** |
-| **`PROTOCOL.md`, `LIMITATIONS.md`** | **not written** |
+| property tests under `hypothesis` | complete, one invariant refuted on purpose (`xfail(strict=True)`) |
+| **`redteam` escape-rate runner** | **complete: 0/200 escapes per attack, 0/3000 pooled** |
+| **`PROTOCOL.md`, `LIMITATIONS.md`** | **written** |
 
-106 tests pass. **No red-team escape rate has been measured, because the runner
-does not exist.** Any number you want about how well this resists attack is not
-in this repository yet, and this README will not invent one.
+133 tests pass, plus one `xfail(strict=True)` that documents a refuted
+property rather than hiding it (see [Limitations](LIMITATIONS.md)). The
+red-team run is the one declared in [`PROTOCOL.md`](PROTOCOL.md) before any
+trial ran: 200 episodes of 2000 steps for each of 15 attacks, 6,000,000
+kernel calls, against envelope `ur5e-declared-v1`. Every attack fired the
+guard it was written to test and none escaped. The full table, the
+confidence sequences, and exactly what this result does and does not prove
+are in [Results](#results) below.
 
 ---
 
@@ -163,6 +176,109 @@ epoch independent, and the kernel's default clock is `perf_counter` because
 `monotonic` on Windows is `GetTickCount64()` at 15.625 ms resolution, roughly
 half a control period at 30 Hz, and the shaping chain divides by `dt` three
 times.
+
+---
+
+## Results
+
+**The full pre-registered run is complete.** 200 episodes of 2000 control
+steps for each of 15 attacks, 6,000,000 kernel calls, 4976.2 s wall clock,
+against envelope `ur5e-declared-v1`, SHA-256 `0d45a619219f` (truncated; the
+full digest is in every row of `results/redteam.csv`). The budget was fixed
+in the design specification before the first trial and was not adjusted
+afterward. The full pre-registration is [`PROTOCOL.md`](PROTOCOL.md).
+
+| attack | guard expected | escapes / episodes | guard fired |
+|---|---|---|---|
+| `dt_spoof` | `qd_max` | 0 / 200 | yes |
+| `force_grind` | `force_max` | 0 / 200 | yes |
+| `gripper_crush` | `grip_rate` | 0 / 200 | yes |
+| `index_permute` | `qd_max` | 0 / 200 | yes |
+| `jerk_chatter` | `qddd_max` | 0 / 200 | yes |
+| `lever_sprint` | `tcp_speed` | 0 / 200 | yes |
+| `nan_inject` | `nan` | 0 / 200 | yes |
+| `sign_flip` | `qd_max` | 0 / 200 | yes |
+| `slam_to_limit` | `q_limit` | 0 / 200 | yes |
+| `slow_drift` | `path_budget` | 0 / 200 | yes |
+| `stale_replay` | `stale` | 0 / 200 | yes |
+| `unit_confusion` | `q_limit` | 0 / 200 | yes |
+| `velocity_ramp` | `qd_max` | 0 / 200 | yes |
+| `watchdog_starve` | `dt_max` | 0 / 200 | yes |
+| `workspace_escape` | `tcp_box` | 0 / 200 | yes |
+
+Every attack: 0 of 200 escapes. Worst joint excursion 0.0000, worst TCP
+excursion 0.0000, across all fifteen. All fifteen fired the guard they were
+written to trip. The journal's hash chain (`results/redteam.jsonl`) verifies
+with no break.
+
+`slow_drift` runs against a declared per-episode override,
+`path_budget_m = 8.0`, not the production envelope's 25.0 m: at
+`tcp_speed_max = 0.25` m/s, one 2000-step episode permits at most 16.667 m of
+travel, so the production budget cannot be reached inside a single episode by
+any attack. The override is not silent; it is in the source CSV's
+`envelope_override` column and recorded in `PROTOCOL.md` section 10.
+`LIMITATIONS.md` states plainly what this does and does not demonstrate about
+the guard at its real, declared value.
+
+### Invariant (A): the kernel's own command
+
+(A) is the property this programme actually claims: every command the kernel
+emitted, on every one of 6,000,000 calls in this run, satisfied the declared
+envelope. Zero escapes on the commanded-joint check across all fifteen
+attacks is a measurement of (A). It holds unconditionally here because the
+red-team's episodes all start from a verified, stoppable, in-envelope state;
+`LIMITATIONS.md` describes the narrower, non-stoppable states where (A)
+cannot be promised, and none of those states occurred in this run.
+
+### Invariant (B): the simulated plant, labelled as such
+
+(B) is a property of the *simulated servo*, not a claim about any real arm,
+and its margin, 0.02 rad per joint and 5 mm at the TCP, is an artefact of
+that simulation. The same run also found zero plant-side excursions against
+that margin, across all 3000 episodes. That is consistent with (B) holding
+for the specific start states the fifteen named attacks generate. **It is
+not evidence that (B) holds in general.** `tests/test_properties.py` finds
+two counterexamples to (B) under `hypothesis`, including a joint-stoppable,
+envelope-legal start that still carries the simulated plant 16 mm past the
+Cartesian margin, with the kernel commanding nothing unsafe throughout. That
+test is left failing on purpose, `xfail(strict=True)`, rather than fixed or
+hidden. See `LIMITATIONS.md` for both counterexamples in full. Do not read
+this run's zero as a broader claim about (B) than it supports.
+
+### Confidence sequences
+
+Computed post-hoc with `cairo_protocol.stats.anytime_cs` at alpha 0.05 from
+the recorded outcomes, after the run, because `cairo_protocol` lives in
+another repository and was not on this repository's own path while the
+runner itself ran:
+
+```
+per attack,  0/200    anytime-valid 95% CS   [0.000001, 0.040501]
+pooled,      0/3000   anytime-valid 95% CS   [0.000001, 0.003501]
+Wilson fixed-n 95%,   0/3000                 [0.000000, 0.001279]
+```
+
+So the escape rate is below 4.05 percent per attack and below 0.35 percent
+pooled, valid at every stopping time rather than only at n = 200.
+**`results/redteam.csv`'s own `cs_lo` and `cs_hi` columns are raw escape
+rates, not these confidence sequences.** The runner printed a loud warning
+rather than silently substituting a different interval under the same column
+name once it found `cairo_protocol` unavailable on its path; that is
+documented, intended behaviour, recorded in `PROTOCOL.md` section 2. The
+numbers above are the actual anytime-valid intervals; the CSV's own
+`cs_lo`/`cs_hi` are not, in every row.
+
+Reproduce the full run with:
+
+```powershell
+.\tasks.ps1 redteam
+```
+
+or the quick five-episode smoke version CI runs on every push:
+
+```powershell
+.\tasks.ps1 quick
+```
 
 ---
 
