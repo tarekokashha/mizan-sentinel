@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mizan-sentinel"
+version = "0.1.0"
+description = "A safety kernel for the UR5e that no action sequence can drive outside a declared envelope"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Tarek" }]
+keywords = ["robotics", "safety", "universal-robots", "ur5e", "adversarial-testing"]
+
+# numpy only. scipy is NOT a runtime dependency of this package: nothing in
+# sentinel/ imports it. It stays in requirements.txt because cairo_protocol,
+# which the red-team runner uses for confidence sequences when it is present,
+# prefers scipy.special.betaln and silently falls back to math.lgamma without
+# it. An installed consumer of this package does not need that.
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "hypothesis>=6.100", "scipy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/tarekokashha/mizan-sentinel"
+Issues = "https://github.com/tarekokashha/mizan-sentinel/issues"
+
+[project.scripts]
+sentinel-redteam = "sentinel.redteam:main"
+
+[tool.setuptools]
+packages = ["sentinel"]

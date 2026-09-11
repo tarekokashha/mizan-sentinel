@@ -11,3 +11,8 @@ __pycache__/
 results/*.jsonl
 results/*.csv
 !results/.gitkeep
+
+# build artefacts
+*.egg-info/
+build/
+dist/
