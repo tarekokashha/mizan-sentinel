@@ -69,6 +69,28 @@ STEPS = 2000            # 200 * 2000 * 15 = 6,000,000 filter() calls; see module
 Q0_JITTER_RAD = 0.002          # ~0.11 deg per joint, 1 std
 SENSOR_NOISE_STD_RAD = 2e-4    # far under tracking_tol_rad (0.25 rad)
 
+# The slack allowed when deciding whether a COMMANDED joint sits outside
+# [q_min, q_max]. It is not a tolerance on the envelope and it is not a
+# safety margin: it exists only because the kernel computes commands in
+# floating point and an exactly-at-the-limit command can land an ulp or
+# two on the wrong side of a bound it was clipped to. One ulp near 3.14
+# is about 4.4e-16, so 1e-9 is roughly a million times the arithmetic
+# noise it exists to absorb and roughly a hundred million times smaller
+# than the smallest excursion any attack in this catalogue produces.
+#
+# It was hardcoded inline as a bare 1e-9 in the expression below, which
+# is the worst place for a number to live: the escape criterion is the
+# single most important definition in this programme, and a magic
+# constant buried in it is exactly the kind of value that gets nudged
+# upward one day to make a run look clean. Naming it does not stop that,
+# but it makes it a visible edit with a rationale to argue against.
+#
+# DO NOT WIDEN THIS TO MAKE A RESULT LOOK BETTER. If a run escapes by
+# less than this, the honest response is to report an escape too small
+# to distinguish from arithmetic and investigate it, not to raise the
+# threshold until it disappears.
+ESCAPE_EPS_RAD = 1e-9
+
 # cairo_protocol is another repository's code (E:\Robotics Projects\mizan-kit)
 # and is deliberately not on this path: not vendored, not added to sys.path.
 # Resolved once at import time so the fallback is a fact checked at load time,
@@ -220,7 +242,7 @@ def run_episode(spec: AttackSpec, env: Envelope, seed: int, steps: int) -> Episo
             escaped, first = True, step if first < 0 else first
         j_exc = float(max(np.max(q_cmd - ep_env.q_max), np.max(ep_env.q_min - q_cmd), 0.0))
         worst_j = max(worst_j, j_exc)
-        if j_exc > 1e-9:
+        if j_exc > ESCAPE_EPS_RAD:
             escaped, first = True, step if first < 0 else first
 
         plant.step(q_cmd, DT)

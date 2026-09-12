@@ -192,12 +192,63 @@ sweep of joint 0 across the full range
 base sweep can sustain with real margin inside the declared workspace box,
 not the arm's datasheet 0.85 m reach. At the declared `qd_max` of 1.0 rad/s
 that produces 0.645023 m/s of flange speed against the 0.25 m/s TCP limit, a
-ratio of 2.58, entirely caught by the Cartesian speed guard alone with every
-joint-space limit respected exactly. The guard is demonstrated against a
-hazard about 24 percent smaller than the longest lever the real machine's
-0.85 m reach could in principle present.
+ratio of 2.58. The guard is demonstrated against a hazard about 24 percent
+smaller than the longest lever the real machine's 0.85 m reach could in
+principle present.
+
+**And the Cartesian guard is not demonstrated in isolation, which an earlier
+version of this section claimed.** It said the hazard was "entirely caught
+by the Cartesian speed guard alone with every joint-space limit respected
+exactly". Half of that is true and half of it was never measured. Counted
+over a 2000 step `lever_sprint` episode against the declared envelope:
+
+| guard | steps it fired on | share |
+|---|---|---|
+| `brake_accel` | 1999 | 100.0% |
+| `qdd_max` | 1999 | 100.0% |
+| `qd_max` | 1998 | 99.9% |
+| `qddd_max` | 1933 | 96.7% |
+| `tcp_speed` | 1489 | 74.5% |
+
+`tcp_speed` **never fires alone**: there is no step in the episode where it
+is the only guard reporting a violation, and the most common outcome by far
+is all five firing together, on 1664 of 2000 steps. So the joint-space
+shaping guards are doing continuous work throughout, and this episode does
+not isolate the Cartesian guard's contribution from theirs.
+
+What is true, and was measured rather than assumed, is the second half: the
+worst commanded joint excursion beyond `[q_min, q_max]` across the episode
+is **exactly 0.000000000000 rad**. Every joint-space limit is respected
+exactly in the output. That is a statement about what the kernel emits, not
+evidence that only one guard was needed to get there.
+
+The correction matters because the original sentence would have let a reader
+cite this episode as an isolated demonstration of Cartesian speed limiting,
+which it is not. An isolated demonstration would need an attack that trips
+`tcp_speed` while leaving the joint-space guards quiet, and this catalogue
+does not contain one.
 
 ## Housekeeping honesty
+
+**The escape criterion's slack is now named, and the kernel's internal
+epsilons are not.** `sentinel/redteam.py` used to decide whether a commanded
+joint had left `[q_min, q_max]` with a bare `1e-9` written inline in the
+expression that applied it. That is the single most important definition in
+this programme and it should not have had a magic number buried in it, so it
+is now `ESCAPE_EPS_RAD` with its arithmetic justification beside it and two
+tests holding it: one that fails if it is widened, and one that drives a
+command ten times the epsilon past a joint limit and requires the runner to
+call it an escape.
+
+`sentinel/kernel.py` still carries nine `1e-12` comparisons. They are a
+different kind of number: float-equality checks asking whether the shaper
+changed a value, and slack on the kernel's own self-assertions that its
+output respects a limit. They are not escape decisions and nothing in the
+published results depends on their exact value. They are recorded here
+rather than changed, because editing nine comparisons inside working safety
+code to tidy a category they do not belong to is a worse trade than naming
+them in this file.
+
 
 **`scipy` is declared in `requirements.txt` and imported by no module under
 `sentinel/`.** `grep -rn "scipy" sentinel/ tests/` returns nothing. That is

@@ -262,3 +262,70 @@ def test_the_envelope_override_is_visible_in_the_table_and_the_csv(tmp_path, cap
     csv_text = out_csv.read_text(encoding="utf-8")
     assert "path_budget_m" in csv_text and "8.0" in csv_text, (
         "the override never appears in the CSV")
+
+
+def test_the_escape_epsilon_is_named_and_cannot_be_quietly_widened():
+    """The escape criterion is the most important definition in this
+    programme, and its slack used to be a bare 1e-9 inline in the
+    expression that applies it.
+
+    A magic constant buried in a safety decision is exactly the kind of
+    value that gets nudged upward one day to make a run look clean. This
+    pins the direction: ESCAPE_EPS_RAD may be tightened, never loosened,
+    and loosening it has to fail a test with a name that says what happened
+    rather than slipping through as a one-character diff.
+
+    The bound is arithmetic, not a judgement. One ulp near the declared
+    joint limit of pi is about 4.4e-16, so 1e-9 is already about a million
+    times the floating point noise it exists to absorb.
+    """
+    from sentinel.redteam import ESCAPE_EPS_RAD
+
+    assert ESCAPE_EPS_RAD <= 1e-9, (
+        f"ESCAPE_EPS_RAD was widened to {ESCAPE_EPS_RAD:g}. An escape smaller "
+        f"than the threshold is still an escape: report it and investigate, "
+        f"do not raise the bar until it disappears.")
+    assert ESCAPE_EPS_RAD > 0.0, "a zero epsilon makes exact-limit commands flap on float noise"
+
+    ulp_at_limit = float(np.spacing(np.pi))
+    assert ESCAPE_EPS_RAD > ulp_at_limit * 1000, (
+        f"ESCAPE_EPS_RAD {ESCAPE_EPS_RAD:g} is not comfortably above one ulp "
+        f"at the joint limit ({ulp_at_limit:g}), so it no longer absorbs the "
+        f"arithmetic noise it exists for")
+
+
+def test_an_escape_just_above_the_epsilon_is_still_reported(monkeypatch):
+    """The epsilon must not become a silent amnesty band.
+
+    Follows the same shape as test_a_deliberately_broken_kernel_is_caught:
+    break the kernel deliberately, in a way that lands a command just past
+    the declared joint limit by ten times ESCAPE_EPS_RAD, and require the
+    runner to call it an escape. Without this, widening the constant would
+    be caught only by the bound above, and a bound is easier to argue with
+    than a demonstration.
+    """
+    import sentinel.kernel as kern
+    from sentinel.redteam import ESCAPE_EPS_RAD
+
+    env = Envelope.ur5e_declared()
+    real_filter = kern.SafetyKernel.filter
+    over = ESCAPE_EPS_RAD * 10.0
+
+    # Joint 5 on purpose. Nudging joint 0 instead makes this test pass for
+    # the wrong reason: it swings the flange out of the Cartesian box, so the
+    # plant TCP check reports the escape and the commanded-joint check under
+    # test never has to work. Verified by mutation: with joint 0, disabling
+    # the commanded-joint check entirely left this test green. Joint 5 is the
+    # tool roll and moving it does not translate the flange origin, so the
+    # joint check is the only thing that can catch this.
+    def nudge_past_the_limit(self, state, action):
+        verdict = real_filter(self, state, action)
+        if verdict.action.q is not None:
+            verdict.action.q[5] = env.q_max[5] + over
+        return verdict
+
+    monkeypatch.setattr(kern.SafetyKernel, "filter", nudge_past_the_limit)
+    r = run_attack("slam_to_limit", env, episodes=1, steps=20, seed=0)
+    assert r.escape_rate > 0.0, (
+        f"a command {over:g} rad beyond q_max, ten times the epsilon, was not "
+        f"reported as an escape")
