@@ -30,8 +30,29 @@ class Shield:
     def disconnect(self):
         return self.robot.disconnect()
 
+    # The three hooks below are soft delegations, and deliberately so. This
+    # module's contract is that the wrapped object "needs only
+    # get_observation and send_action in the LeRobot dict shape", so a
+    # wrapped object is not required to have a lifecycle hook at all. Hard
+    # delegation would break that contract: `calibrate` used to do it, and
+    # would have raised AttributeError against the minimal FakeRobot this
+    # repository's own Shield tests wrap, had anything ever called it.
+    #
+    # The fallbacks are LeRobot's own documented defaults, not invented
+    # behaviour. Robot.is_calibrated's docstring says it "should be always
+    # True if not applicable", and configure has nothing to do for a wrapper
+    # that holds no device settings of its own.
     def calibrate(self):
-        return self.robot.calibrate()
+        inner = getattr(self.robot, "calibrate", None)
+        return inner() if callable(inner) else None
+
+    def configure(self):
+        inner = getattr(self.robot, "configure", None)
+        return inner() if callable(inner) else None
+
+    @property
+    def is_calibrated(self) -> bool:
+        return bool(getattr(self.robot, "is_calibrated", True))
 
     @property
     def is_connected(self):

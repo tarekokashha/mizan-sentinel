@@ -21,6 +21,12 @@ dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "hypothesis>=6.100", "scipy>=1.11"]
+# Optional, and optional on purpose. sentinel.lerobot_plugin is the only
+# module that imports lerobot, nothing else in the package imports that
+# module, and `import sentinel` does not pull it in. A safety kernel that
+# cannot be installed without a large ML stack is one people vendor a copy
+# of instead, which is worse than depending on it.
+lerobot = ["lerobot>=0.4.4"]
 
 [project.urls]
 Homepage = "https://github.com/tarekokashha/mizan-sentinel"
