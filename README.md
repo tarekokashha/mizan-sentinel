@@ -41,6 +41,7 @@ and it matters more than the number.
 - [Quick start](#quick-start)
 - [The result](#the-result)
 - [What is verified, and what is not](#what-is-verified-and-what-is-not)
+- [What composition found](#what-composition-found): two defects in here, found from outside
 - [Repository layout](#repository-layout)
 - [How this was built](#how-this-was-built)
 
@@ -191,11 +192,21 @@ suite asserts that every one fires.
 | `watchdog_starve` | `dt_max` | stop calling for longer than the watchdog |
 | `slow_drift` | `path_budget` | endless legal oscillation; no instantaneous bound can see it |
 
-The interesting two are the ones that are **legal at every instant**.
-`lever_sprint` respects every joint-space limit exactly and still moves the
-flange at 2.58 times the declared Cartesian limit, because speed is
-`‖J(q)‖·‖q̇‖` and the lever arm does the work. `slow_drift` never approaches any
-limit at all and simply never stops, which only a cumulative budget can see.
+The interesting two are the ones no instantaneous joint bound would catch on
+its own. `lever_sprint` sweeps the base so that the flange moves at 2.58 times
+the declared Cartesian limit, because speed is `‖J(q)‖·‖q̇‖` and the lever arm
+does the work. `slow_drift` never approaches any limit at all and simply never
+stops, which only a cumulative budget can see.
+
+Be careful with `lever_sprint`, because an earlier version of this page was
+not. What is exact is the **output**: across a 2000 step episode the worst
+commanded joint excursion beyond `[q_min, q_max]` is `0.000000000000` rad. What
+is not true is that the attack is joint-legal and caught by the Cartesian guard
+alone. Counted over that episode, `brake_accel` and `qdd_max` fire on 1999
+steps, `qd_max` on 1998, `qddd_max` on 1933, and `tcp_speed` on 1489, and
+`tcp_speed` **never fires alone**. The joint-space shaping guards are working
+continuously throughout, so this episode does not isolate the Cartesian guard's
+contribution. [`LIMITATIONS.md`](LIMITATIONS.md) carries the full table.
 
 ---
 
@@ -223,6 +234,21 @@ robot  = Shield(your_lerobot_follower, kernel)
 obs = robot.get_observation()
 robot.send_action({"joint_position": policy(obs)})   # filtered, always
 ```
+
+`Shield` implements every member `lerobot.robots.Robot` declares, so duck-typed
+use works with nothing extra installed. If your caller checks the type, or goes
+through LeRobot's own registry and factory machinery, wrap it once more:
+
+```python
+# pip install "mizan-sentinel[lerobot]"
+from sentinel.lerobot_plugin import ShieldRobot
+
+robot = ShieldRobot(Shield(your_follower, kernel), your_robot_config)
+assert isinstance(robot, lerobot.robots.Robot)
+```
+
+The adapter forwards every call unmodified. It adds no safety logic, so the
+guarantee stays a statement about the kernel rather than about the adapter.
 
 Run the red team yourself:
 
@@ -303,10 +329,12 @@ tampering, deletion, re-attribution and truncation. The full pre-registered run.
   zeroes the cumulative budgets. Zero escapes across 15 attacks sounds like it
   tests the kernel; it tests half of it.
 - **No hardware, ever**, and every limit is declared rather than measured.
-- **The Shield has never been composed with the driver it wraps.** That driver
-  lives in a separate repository. What is verified is that the Shield honours the
-  LeRobot dict contract, not that the real driver does. *This is what M-03
-  KEYSTONE exists to close.*
+- **The Shield is now composed with a real driver, and that closed this entry
+  by finding two defects here.** It used to read: the Shield has never been
+  composed with the driver it wraps, so what is verified is that the Shield
+  honours the LeRobot dict contract, not that the real driver does. M-03
+  KEYSTONE did the composing. See
+  [What composition found](#what-composition-found).
 
 Invariant (A) also carries two stated narrowings: it holds only from a
 **stoppable** start, and its derivative guarantee, though not its position
@@ -326,8 +354,9 @@ sentinel/
   attacks.py      fifteen adversarial action generators
   redteam.py      the runner, escape rates, journal, CSV
   shield.py       drop-in wrapper over any LeRobot-style follower
+  lerobot_plugin.py  optional: a real lerobot.robots.Robot subclass over a Shield
   journal.py      append-only hash-chained verdict log
-tests/            161 passing, 1 deliberate xfail, including property tests
+tests/            175 passing, 1 deliberate xfail, including property tests
 results/          the committed canonical run
 docs/decisions/   defect records: what was claimed, measured, and changed
 ```
@@ -381,14 +410,68 @@ cosmetic. It was the load-bearing half of the run's statistical validity.
 
 ---
 
+## What composition found
+
+[**M-03 KEYSTONE**](https://github.com/tarekokashha/mizan-keystone) attached this
+kernel to a real LeRobot UR5e driver over RTDE. Its central design decision is a
+subtraction: the vendor skeleton's six safety defects are not fixed there, they
+are *removed*, because safety is this kernel's job and a driver carrying its own
+half-correct clamps is worse than one carrying none.
+
+It closed the largest thing this programme could not verify about itself. Every
+value reaching `servoJ` across all fifteen attacks, 7600 control steps, was
+bit-identical to what this kernel emitted. Zero unauthorised commands.
+
+It also found two defects **in here**, and both are now fixed.
+
+### 1. The Shield was not a LeRobot plugin
+
+It implemented eight of the ten members `lerobot.robots.Robot` declares, missing
+`configure` and `is_calibrated`, which are **exactly the two the vendor driver
+skeleton was missing**. This programme diagnosed that defect one layer down and
+shipped it one layer up.
+
+It could not be seen from here. Every Shield test in this repository wraps a
+fake built to the LeRobot dict contract, and a dict-contract fake performs no
+abstract-API check, so the probe silently encoded the absence of the check that
+would have caught it.
+
+`Shield` now implements all ten. For callers that need `isinstance`, the
+optional [`sentinel.lerobot_plugin`](sentinel/lerobot_plugin.py) provides a real
+`Robot` subclass. It is optional on purpose: importing the base class would make
+a large ML stack a hard dependency of a numpy-only safety kernel, which is how a
+kernel ends up vendored rather than depended on.
+
+### 2. The staleness guard was blind through a real driver
+
+Guard 2 asks whether the driver's observation stamp is advancing. The real
+driver answered with `time.perf_counter()`, a host clock, which advances whether
+or not the RTDE stream does. A stalled controller still looked fresh, and
+`stale_replay` through the composition fired `qdd_max`, `qddd_max`, `tcp_box`
+and `tcp_speed` and never `stale`, the guard it declares.
+
+Neither programme could have found it alone. This repository's fake driver could
+freeze its own stamp; a real driver reading a host clock cannot. The probe could
+express a stall the shipped driver could never produce. The fix landed in
+KEYSTONE, which now stamps from the controller's own clock.
+
+### The pattern, twice over
+
+Both are this repository's own lesson, arriving from outside it:
+
+> Measuring a component does not validate the composition. A probe written
+> before a guard exists silently encodes that guard's absence as an assumption.
+
+That sentence was written here, in [`CONTRIBUTING.md`](CONTRIBUTING.md), before
+either defect was known.
+
 ## What comes next
 
-**M-03 KEYSTONE** attaches this kernel to a real LeRobot UR5e driver over RTDE,
-closing the largest thing this programme could not verify about itself. Its
-central design decision is a subtraction: the vendor skeleton's six safety
-defects are not fixed there, they are *removed*, because safety is this kernel's
-job and a driver carrying its own half-correct clamps is worse than one carrying
-none.
+`servoJ` has still never been issued to a controller, simulated or real. URSim
+serves RTDE reads on CI, but `RTDEControlInterface` needs remote control mode
+that headless URSim does not offer, so every result in both repositories rests
+on a simulated plant or a deterministic fake. That is the next gap, and it needs
+hardware or a pendant.
 
 ---
 
