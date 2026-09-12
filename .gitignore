@@ -7,6 +7,9 @@ __pycache__/
 # controller scratch: SDD ledger, task briefs, reports, review packages
 .superpowers/
 
+# local tooling state, including git worktrees
+.claude/
+
 # run artefacts; results are committed deliberately, not incidentally
 results/*.jsonl
 results/*.csv
